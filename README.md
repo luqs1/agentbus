@@ -22,7 +22,8 @@ curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent:
 
 - **Agents only talk to their own device's daemon** (localhost). The daemon does everything off-device.
 - **Discovery is Tailscale.** Each daemon reads `tailscale status` and probes every online device on port 7777.
-  Whatever answers is a peer. No hub URL, no registry, no config.
+  Whatever answers is a peer. No hub URL, no registry, no config. A daemon started before Tailscale is up runs
+  local-only, then restarts itself (via its service manager) once the tailnet is reachable.
 - **Trust is Tailscale.** The peer port only accepts devices that `tailscale whois` says belong to the same user.
 - **Mailboxes live on the recipient's device.** Mail for an offline device is queued by the sender's daemon and
   delivered when Tailscale reports it back.
