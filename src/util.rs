@@ -80,18 +80,26 @@ pub fn is_wsl() -> bool {
 
 // --- Tailscale -------------------------------------------------------------------------------
 
+/// The macOS app binary guesses CLI vs GUI mode from SHLVL/TERM/PS1, none of which launchd sets, and without
+/// them it tries to open the GUI and fails. This forces CLI mode (https://tailscale.com/kb/1080/cli); other
+/// platforms' CLIs ignore it.
+const TAILSCALE_ENV: (&str, &str) = ("TAILSCALE_BE_CLI", "1");
+
+/// The first working Tailscale CLI. A miss isn't cached, so a daemon started before Tailscale was installed finds it later.
 pub fn tailscale_bin() -> Option<&'static str> {
-    static BIN: OnceLock<Option<&'static str>> = OnceLock::new();
-    *BIN.get_or_init(|| {
-        ["tailscale", "/mnt/c/Program Files/Tailscale/tailscale.exe", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
-            .into_iter()
-            .find(|b| Command::new(b).arg("version").output().map(|o| o.status.success()).unwrap_or(false))
-    })
+    static BIN: OnceLock<&'static str> = OnceLock::new();
+    if let Some(b) = BIN.get() {
+        return Some(b);
+    }
+    let found = ["tailscale", "/mnt/c/Program Files/Tailscale/tailscale.exe", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
+        .into_iter()
+        .find(|b| Command::new(b).env(TAILSCALE_ENV.0, TAILSCALE_ENV.1).arg("version").output().map(|o| o.status.success()).unwrap_or(false))?;
+    Some(BIN.get_or_init(|| found))
 }
 
 pub async fn tailscale_json(args: &[&str]) -> Option<Value> {
     let bin = tailscale_bin()?;
-    let out = tokio::process::Command::new(bin).args(args).output().await.ok()?;
+    let out = tokio::process::Command::new(bin).env(TAILSCALE_ENV.0, TAILSCALE_ENV.1).args(args).output().await.ok()?;
     serde_json::from_slice(&out.stdout).ok()
 }
 

@@ -861,6 +861,7 @@ pub async fn run() -> Result<()> {
 
     let bind = std::env::var("AGENTBUS_PEER_BIND").ok().or_else(|| d.tailnet_ip.clone());
     let peer_port: u16 = std::env::var("AGENTBUS_PEER_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(port);
+    let mut peer_up = false;
     if let Some(bind) = bind {
         let peer = Router::new()
             .route("/health", get(health))
@@ -871,6 +872,7 @@ pub async fn run() -> Result<()> {
             Ok(l) => {
                 println!("peers: http://{bind}:{peer_port} (tailnet, {})", d.self_login.as_deref().unwrap_or("no login"));
                 tokio::spawn(async move { axum::serve(l, peer.into_make_service_with_connect_info::<SocketAddr>()).await });
+                peer_up = true;
             }
             Err(e) => eprintln!("peer listener on {bind}:{peer_port} failed: {e}"),
         }
@@ -881,9 +883,31 @@ pub async fn run() -> Result<()> {
     tokio::spawn(async move {
         loop {
             refresher.refresh_peers().await;
+            // Started before Tailscale was up (e.g. at login)? Once the peer listener could bind, exit so the service
+            // manager (launchd KeepAlive / systemd Restart=always) restarts us with the tailnet name, login and IP.
+            if !peer_up {
+                if let Some(bind) = tailnet_bind().await {
+                    if tokio::net::TcpListener::bind((bind.as_str(), peer_port)).await.is_ok() {
+                        println!("tailnet is up ({bind}): exiting so the service restarts with it");
+                        std::process::exit(75);
+                    }
+                }
+            }
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
     axum::serve(listener, local).await?;
     Ok(())
+}
+
+/// Where the peer listener should bind right now: AGENTBUS_PEER_BIND, or this device's IPv4 once Tailscale is running.
+async fn tailnet_bind() -> Option<String> {
+    if let Ok(b) = std::env::var("AGENTBUS_PEER_BIND") {
+        return Some(b);
+    }
+    let st = tailscale_json(&["status", "--json"]).await?;
+    if st["BackendState"].as_str() != Some("Running") {
+        return None;
+    }
+    ipv4(&st["Self"]["TailscaleIPs"])
 }
