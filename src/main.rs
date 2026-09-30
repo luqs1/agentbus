@@ -99,7 +99,12 @@ enum H2hCmd {
         /// What to call them here (default: the name in their code)
         #[arg(long = "as")]
         as_: Option<String>,
+        /// Folder to share with them (their agents can only be answered from here)
+        #[arg(long)]
+        share: Option<String>,
     },
+    /// Set the folder shared with one person ("" for the default); everything outside it is refused
+    Share { name: String, folder: String },
     /// People you've paired with
     Contacts,
     /// Let a contact read anything inside your workspace without asking (changes still ask)
@@ -140,7 +145,14 @@ fn h2h(cmd: H2hCmd) -> Result<()> {
     let t = Duration::from_secs(15);
     match cmd {
         H2hCmd::Code => h2h_call("h2h-code", json!({}), t),
-        H2hCmd::Add { code, as_ } => h2h_call("h2h-add", json!({ "code": code, "name": as_ }), Duration::from_secs(60)),
+        H2hCmd::Add { code, as_, share } => {
+            let share = share.map(|f| std::fs::canonicalize(expand_home(&f)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(f));
+            h2h_call("h2h-add", json!({ "code": code, "name": as_, "share": share }), Duration::from_secs(60))
+        }
+        H2hCmd::Share { name, folder } => {
+            let folder = if folder.is_empty() { folder } else { std::fs::canonicalize(expand_home(&folder)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(folder) };
+            h2h_call("h2h-share", json!({ "name": name, "folder": folder }), t)
+        }
         H2hCmd::Contacts => h2h_call("h2h-contacts", json!({}), t),
         H2hCmd::Trust { name } => h2h_call("h2h-level", json!({ "name": name, "level": "trusted" }), t),
         H2hCmd::Normal { name } => h2h_call("h2h-level", json!({ "name": name, "level": "normal" }), t),
@@ -202,7 +214,7 @@ fn main() {
                         return Err(anyhow!("installed, but the daemon isn't answering yet; then run: agentbus h2h add {code}"));
                     }
                     println!();
-                    h2h(H2hCmd::Add { code, as_: None })?;
+                    h2h(H2hCmd::Add { code, as_: None, share: None })?;
                     println!();
                     h2h_call("h2h-code", json!({ "short": "1" }), t)?;
                 }

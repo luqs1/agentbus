@@ -51,8 +51,9 @@ handshake, before a byte of their request is read. So your code is safe to share
 are no invite secrets to leak. `agentbus h2h remove NAME` cuts someone off the same way. Once connected, their agents
 see you under "people" in `list_agents` and reach you with the `ask` tool (`agentbus ask luqmaan "…"` from a shell).
 
-**Answering.** A request from a contact is answered by a headless Claude Code (`claude -p`) in your workspace (your home
-folder by default; `agentbus h2h config workspace ~/notes`). It gets only Read/Grep/Glob/Edit/Write/Bash, none of your MCP
+**Answering.** A request from a contact is answered by a headless Claude Code (`claude -p`) in the folder you share with
+that person (`agentbus h2h share nikita ~/notes/with-nikita`, or `h2h add CODE --share FOLDER`; a default for everyone
+with `h2h config workspace`). Share nothing and their requests get "nothing shared yet". It gets only Read/Grep/Glob/Edit/Write/Bash, none of your MCP
 servers or settings, and a system prompt that frames the request as coming from that person. Its final message goes back
 to the asking agent's inbox.
 
@@ -62,8 +63,9 @@ to the asking agent's inbox.
 | Action | Decision |
 |---|---|
 | Read a sensitive path (`~/.ssh`, `~/.aws`, `~/.claude`, `.env`, `*.pem`, agentbus's own data, …) | always denied |
+| Read or change anything outside the folder shared with that person | always denied |
 | Read inside a folder you "always allowed" for that person | allowed, logged |
-| Read, contact marked `trusted`, inside the workspace | allowed, logged |
+| Read, contact marked `trusted`, inside their folder | allowed, logged |
 | Any other read | [Jev](https://docs.typesafe.ai) judges it from your past manual decisions; allowed if confident (≥ 0.85), else **asks you** |
 | Write, edit, shell command, anything else | **always asks you**, one call at a time |
 | An answer that looks like it contains a credential | asks you before it's sent |
@@ -75,7 +77,7 @@ Every decision, automatic or yours, is in `agentbus h2h log` (and on the status 
 summarising the automatic ones after each answer.
 
 ```sh
-agentbus h2h code | add CODE [--as NAME]
+agentbus h2h code | add CODE [--as NAME] [--share FOLDER] | share NAME FOLDER
 agentbus h2h contacts | trust NAME | normal NAME | block NAME | remove NAME
 agentbus h2h pending | approve ID [--always] | deny ID | log
 agentbus h2h config [name|workspace|responder|model|jev-threshold|typesafe-key VALUE]
