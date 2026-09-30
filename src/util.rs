@@ -24,6 +24,55 @@ pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
 }
 
+/// The daemon's database; its folder also holds the iroh key and h2h config.
+pub fn db_path() -> PathBuf {
+    std::env::var("AGENTBUS_DB").map(PathBuf::from).unwrap_or_else(|_| home().join(".local/share/agentbus/bus.db"))
+}
+
+pub fn data_dir() -> PathBuf {
+    db_path().parent().map(Path::to_path_buf).unwrap_or_else(|| home().join(".local/share/agentbus"))
+}
+
+/// `~/x` -> `$HOME/x`.
+pub fn expand_home(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None if p == "~" => home(),
+        None => PathBuf::from(p),
+    }
+}
+
+/// `$HOME/x` -> `~/x`, for display.
+pub fn tilde(p: &str) -> String {
+    let h = home().to_string_lossy().into_owned();
+    match p.strip_prefix(&h) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
+        _ => p.to_string(),
+    }
+}
+
+/// Finds a command on PATH or in the usual per-user install spots (launchd's PATH is minimal).
+pub fn find_exe(name: &str) -> Option<PathBuf> {
+    let path = std::env::var("PATH").unwrap_or_default();
+    let extra = [home().join(".local/bin"), home().join(".claude/local"), home().join(".bun/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
+    path.split(':').filter(|p| !p.is_empty()).map(PathBuf::from).chain(extra).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+/// Names the kind of credential `text` seems to contain, if any. Cheap and conservative: a match only holds a message
+/// back for the owner to look at.
+pub fn secret_scan(text: &str) -> Option<&'static str> {
+    if text.contains("-----BEGIN") && text.contains("PRIVATE KEY") {
+        return Some("a private key");
+    }
+    const PREFIXES: [(&str, &str); 9] = [
+        ("sk-ant-", "an Anthropic API key"), ("sk-", "an API key"), ("ghp_", "a GitHub token"), ("gho_", "a GitHub token"),
+        ("github_pat_", "a GitHub token"), ("xoxb-", "a Slack token"), ("xoxp-", "a Slack token"), ("AKIA", "an AWS key"), ("AIza", "a Google API key"),
+    ];
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')).find_map(|w| {
+        PREFIXES.iter().find(|(p, _)| w.starts_with(p) && w.len() >= p.len() + 16).map(|(_, what)| *what)
+    })
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }

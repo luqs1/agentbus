@@ -2,6 +2,7 @@
 //! and across your Tailscale tailnet. Every device runs its own daemon; there is no central hub.
 
 mod daemon;
+mod h2h;
 mod install;
 mod shim;
 mod util;
@@ -13,7 +14,7 @@ use std::time::Duration;
 use util::*;
 
 #[derive(Parser)]
-#[command(name = "agentbus", version, about = "Peer-to-peer messaging for coding agents over Tailscale",
+#[command(name = "agentbus", version, about = "Peer-to-peer messaging for coding agents: across your machines over Tailscale, and with other people over iroh",
           after_help = "Addresses: <task>.<harness>@<machine>, e.g. payments.codex@m4air. Run from inside an agent's shell, \
                         the CLI speaks as that agent; otherwise as <--as>.cli (default me.cli).")]
 struct Cli {
@@ -52,6 +53,19 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Ask a person you've paired with (h2h); the answer arrives in your inbox
+    Ask {
+        to: String,
+        #[arg(required = true, num_args = 1..)]
+        question: Vec<String>,
+        #[arg(long = "as")]
+        as_: Option<String>,
+    },
+    /// People: pair with other people's agentbus and control what their agents may do here
+    H2h {
+        #[command(subcommand)]
+        cmd: H2hCmd,
+    },
     /// Daemons found on the tailnet
     Peers,
     /// Is this device's daemon running?
@@ -62,11 +76,87 @@ enum Cmd {
     Install {
         #[arg(long)]
         no_service: bool,
+        /// Pair with the person who sent this invite once installed
+        #[arg(long)]
+        join: Option<String>,
+        /// Your name, as that person will see it
+        #[arg(long)]
+        name: Option<String>,
     },
     /// stdio MCP server launched by agents (internal)
     Mcp { harness: String },
     /// Claude/Codex hook handler (internal)
     Hook { harness: String },
+}
+
+#[derive(Subcommand)]
+enum H2hCmd {
+    /// Create a one-time invite for one person (valid 7 days)
+    Invite,
+    /// Pair using an invite someone sent you
+    Join {
+        ticket: String,
+        /// Your name, as they will see it
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// People you've paired with
+    Contacts,
+    /// Let a contact read anything inside your workspace without asking (changes still ask)
+    Trust { name: String },
+    /// Back to the default: reads follow your past decisions and Jev, and ask when unsure
+    Normal { name: String },
+    /// Refuse all requests from a contact
+    Block { name: String },
+    /// Forget a contact and the folders you shared with them
+    Remove { name: String },
+    /// Requests waiting for your decision
+    Pending,
+    /// Allow a pending request (--always: share that folder with them from now on)
+    Approve {
+        id: String,
+        #[arg(long)]
+        always: bool,
+    },
+    /// Deny a pending request
+    Deny { id: String },
+    /// Every decision on contacts' requests, automatic ones included
+    Log {
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+    /// Show settings, or set one: name, workspace, responder, model, jev-threshold, typesafe-key ("" to clear)
+    Config { key: Option<String>, value: Option<String> },
+}
+
+/// Posts to the local daemon's h2h API and prints its `text`.
+fn h2h_call(route: &str, body: serde_json::Value, timeout: Duration) -> Result<()> {
+    let r = post_json(&format!("{}/api/{route}", local_url()), &body, timeout)?;
+    println!("{}", r["text"].as_str().unwrap_or(""));
+    Ok(())
+}
+
+fn h2h(cmd: H2hCmd) -> Result<()> {
+    let t = Duration::from_secs(15);
+    match cmd {
+        H2hCmd::Invite => h2h_call("h2h-invite", json!({}), t),
+        H2hCmd::Join { ticket, name } => h2h_call("h2h-join", json!({ "ticket": ticket, "name": name }), Duration::from_secs(60)),
+        H2hCmd::Contacts => h2h_call("h2h-contacts", json!({}), t),
+        H2hCmd::Trust { name } => h2h_call("h2h-level", json!({ "name": name, "level": "trusted" }), t),
+        H2hCmd::Normal { name } => h2h_call("h2h-level", json!({ "name": name, "level": "normal" }), t),
+        H2hCmd::Block { name } => h2h_call("h2h-level", json!({ "name": name, "level": "blocked" }), t),
+        H2hCmd::Remove { name } => h2h_call("h2h-level", json!({ "name": name, "level": "remove" }), t),
+        H2hCmd::Pending => h2h_call("h2h-pending", json!({}), t),
+        H2hCmd::Approve { id, always } => h2h_call("h2h-resolve", json!({ "id": id, "choice": if always { "always" } else { "allow" } }), t),
+        H2hCmd::Deny { id } => h2h_call("h2h-resolve", json!({ "id": id, "choice": "deny" }), t),
+        H2hCmd::Log { limit } => h2h_call("h2h-log", json!({ "limit": limit.to_string() }), t),
+        H2hCmd::Config { key, value } => {
+            if key.is_some() && value.is_none() {
+                return Err(anyhow!("give a value (\"\" clears it)"));
+            }
+            h2h_call("h2h-config", json!({ "key": key.unwrap_or_default(), "value": value.unwrap_or_default() }), t)
+        }
+    }
 }
 
 /// Run from inside an agent's shell, the CLI speaks as that agent (same key as its MCP server and hooks).
@@ -96,12 +186,41 @@ fn main() {
         let t = Duration::from_secs(15);
         match cli.cmd {
             Cmd::Daemon => tokio::runtime::Runtime::new()?.block_on(daemon::run()),
-            Cmd::Install { no_service } => install::install(no_service),
+            Cmd::Install { no_service, join, name } => {
+                install::install(no_service)?;
+                if let Some(ticket) = join {
+                    // The service was just (re)started; give it a moment to come up.
+                    let up = (0..40).any(|_| {
+                        std::thread::sleep(Duration::from_millis(500));
+                        get_json(&format!("{base}/health"), Duration::from_secs(2)).is_ok_and(|h| !h["h2h"].is_null())
+                    });
+                    if !up {
+                        return Err(anyhow!("installed, but the daemon isn't answering yet; pair with: agentbus h2h join {ticket}"));
+                    }
+                    println!();
+                    h2h(H2hCmd::Join { ticket, name })?;
+                }
+                Ok(())
+            }
+            Cmd::H2h { cmd } => h2h(cmd),
+            Cmd::Ask { to, question, as_ } => {
+                let mut body = serde_json::Map::new();
+                for (k, v) in identity(as_) {
+                    body.insert(k.into(), json!(v));
+                }
+                body.insert("to".into(), json!(to));
+                body.insert("question".into(), json!(question.join(" ")));
+                println!("{}", post_json(&format!("{base}/api/ask"), &body.into(), Duration::from_secs(60))?["text"].as_str().unwrap_or(""));
+                Ok(())
+            }
             Cmd::Mcp { harness } => shim::mcp(&harness),
             Cmd::Hook { harness } => shim::hook(&harness),
             Cmd::Status => {
                 let h = get_json(&format!("{base}/health"), Duration::from_secs(3)).map_err(|e| anyhow!("daemon not running at {base} ({e})"))?;
                 println!("agentbus {} on {}: ok ({base})", h["version"].as_str().unwrap_or("?"), h["device"].as_str().unwrap_or("?"));
+                if let Some(id) = h["h2h"]["id"].as_str() {
+                    println!("h2h: {id} as {}", h["h2h"]["name"].as_str().unwrap_or("?"));
+                }
                 Ok(())
             }
             Cmd::Peers => {
