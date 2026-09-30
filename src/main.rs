@@ -76,9 +76,9 @@ enum Cmd {
     Install {
         #[arg(long)]
         no_service: bool,
-        /// Pair with the person who sent this invite once installed
+        /// Add this person's contact code once installed (then send them yours)
         #[arg(long)]
-        join: Option<String>,
+        add: Option<String>,
         /// Your name, as that person will see it
         #[arg(long)]
         name: Option<String>,
@@ -91,14 +91,14 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum H2hCmd {
-    /// Create a one-time invite for one person (valid 7 days)
-    Invite,
-    /// Pair using an invite someone sent you
-    Join {
-        ticket: String,
-        /// Your name, as they will see it
-        #[arg(long)]
-        name: Option<String>,
+    /// Your contact code, to send to someone you want to connect with
+    Code,
+    /// Add someone's contact code. You're connected once they've added yours too
+    Add {
+        code: String,
+        /// What to call them here (default: the name in their code)
+        #[arg(long = "as")]
+        as_: Option<String>,
     },
     /// People you've paired with
     Contacts,
@@ -139,8 +139,8 @@ fn h2h_call(route: &str, body: serde_json::Value, timeout: Duration) -> Result<(
 fn h2h(cmd: H2hCmd) -> Result<()> {
     let t = Duration::from_secs(15);
     match cmd {
-        H2hCmd::Invite => h2h_call("h2h-invite", json!({}), t),
-        H2hCmd::Join { ticket, name } => h2h_call("h2h-join", json!({ "ticket": ticket, "name": name }), Duration::from_secs(60)),
+        H2hCmd::Code => h2h_call("h2h-code", json!({}), t),
+        H2hCmd::Add { code, as_ } => h2h_call("h2h-add", json!({ "code": code, "name": as_ }), Duration::from_secs(60)),
         H2hCmd::Contacts => h2h_call("h2h-contacts", json!({}), t),
         H2hCmd::Trust { name } => h2h_call("h2h-level", json!({ "name": name, "level": "trusted" }), t),
         H2hCmd::Normal { name } => h2h_call("h2h-level", json!({ "name": name, "level": "normal" }), t),
@@ -186,19 +186,25 @@ fn main() {
         let t = Duration::from_secs(15);
         match cli.cmd {
             Cmd::Daemon => tokio::runtime::Runtime::new()?.block_on(daemon::run()),
-            Cmd::Install { no_service, join, name } => {
+            Cmd::Install { no_service, add, name } => {
                 install::install(no_service)?;
-                if let Some(ticket) = join {
+                if let Some(n) = &name {
+                    // Before the daemon reads it: it's how the person being added will see you.
+                    h2h::set_config("name", &slug(n))?;
+                }
+                if let Some(code) = add {
                     // The service was just (re)started; give it a moment to come up.
                     let up = (0..40).any(|_| {
                         std::thread::sleep(Duration::from_millis(500));
                         get_json(&format!("{base}/health"), Duration::from_secs(2)).is_ok_and(|h| !h["h2h"].is_null())
                     });
                     if !up {
-                        return Err(anyhow!("installed, but the daemon isn't answering yet; pair with: agentbus h2h join {ticket}"));
+                        return Err(anyhow!("installed, but the daemon isn't answering yet; then run: agentbus h2h add {code}"));
                     }
                     println!();
-                    h2h(H2hCmd::Join { ticket, name })?;
+                    h2h(H2hCmd::Add { code, as_: None })?;
+                    println!();
+                    h2h_call("h2h-code", json!({ "short": "1" }), t)?;
                 }
                 Ok(())
             }
