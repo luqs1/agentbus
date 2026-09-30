@@ -82,11 +82,20 @@ pub struct Contact {
     pub level: String,
     /// "waiting": we added them, they haven't added us yet; "connected": both have.
     pub state: String,
+    /// The folder shared with this person (None: the default folder from config, if any).
+    pub workspace: Option<String>,
     pub last_seen: Option<i64>,
 }
 
 fn contact_row(r: &rusqlite::Row) -> rusqlite::Result<Contact> {
-    Ok(Contact { id: r.get("id")?, name: r.get("name")?, level: r.get("level")?, state: r.get("state")?, last_seen: r.get("last_seen")? })
+    Ok(Contact {
+        id: r.get("id")?,
+        name: r.get("name")?,
+        level: r.get("level")?,
+        state: r.get("state")?,
+        workspace: r.get("workspace")?,
+        last_seen: r.get("last_seen")?,
+    })
 }
 
 // --- config -----------------------------------------------------------------------------------
@@ -105,7 +114,7 @@ fn cfg(k: &str) -> Option<String> {
 
 pub const CONFIG_KEYS: [(&str, &str); 6] = [
     ("name", "your name, as contacts see it"),
-    ("workspace", "folder the responder answers from (default: your home folder)"),
+    ("workspace", "default folder shared with contacts who have none of their own (default: none)"),
     ("responder", "path to the claude binary (default: found on PATH)"),
     ("model", "model for the responder (default: claude's default)"),
     ("jev-threshold", "auto-allow a read when Jev's probability is at least this (default 0.85)"),
@@ -124,11 +133,7 @@ pub fn set_config(key: &str, value: &str) -> Result<()> {
         let t: f64 = value.parse().map_err(|_| anyhow!("jev-threshold is a number between 0 and 1"))?;
         c[&k] = json!(t.clamp(0.0, 1.0));
     } else if k == "workspace" {
-        let p = expand_home(value);
-        if !p.is_dir() {
-            return Err(anyhow!("{} is not a folder", p.display()));
-        }
-        c[&k] = json!(p.to_string_lossy());
+        c[&k] = json!(check_folder(value)?.to_string_lossy());
     } else {
         c[&k] = json!(value);
     }
@@ -149,8 +154,22 @@ pub fn owner_name() -> String {
     })
 }
 
-fn workspace() -> PathBuf {
-    cfg("workspace").map(PathBuf::from).unwrap_or_else(home)
+/// The folder shared with `c`: their own (`h2h share`), else the configured default. None: nothing is shared.
+fn workspace_for(c: &Contact) -> Option<PathBuf> {
+    let ws = c.workspace.clone().or_else(|| cfg("workspace")).map(PathBuf::from)?;
+    Some(ws.canonicalize().unwrap_or(ws)) // resolve() canonicalizes too (e.g. /tmp -> /private/tmp)
+}
+
+fn check_folder(folder: &str) -> Result<PathBuf> {
+    let p = expand_home(folder);
+    let p = p.canonicalize().map_err(|_| anyhow!("{} is not a folder", p.display()))?;
+    if !p.is_dir() {
+        return Err(anyhow!("{} is not a folder", p.display()));
+    }
+    if is_sensitive(&p) || p == home() || p == Path::new("/") {
+        return Err(anyhow!("refusing to share {}: pick a specific folder", tilde(&p.to_string_lossy())));
+    }
+    Ok(p)
 }
 
 fn typesafe_key() -> Option<String> {
@@ -191,6 +210,7 @@ pub async fn start(d: Arc<Daemon>) -> Result<()> {
         )?;
         // 0.4.0 paired both ways in one step, so its contacts are already mutual.
         let _ = db.execute("alter table h2h_contacts add column state text not null default 'connected'", []);
+        let _ = db.execute("alter table h2h_contacts add column workspace text", []);
         // Responders that were running when the daemon stopped won't finish.
         db.execute("update h2h_requests set status = 'failed', finished_at = ? where status = 'running'", [now_ms()])?;
     }
@@ -370,7 +390,7 @@ impl H2h {
             "insert into h2h_contacts (id, name, level, state, created_at) values (?, ?, 'normal', 'waiting', ?)",
             params![id, name, now_ms()],
         );
-        Contact { id: id.into(), name, level: "normal".into(), state: "waiting".into(), last_seen: None }
+        Contact { id: id.into(), name, level: "normal".into(), state: "waiting".into(), workspace: None, last_seen: None }
     }
 
     /// This device's contact code: its public key and the owner's name. Not a secret: knowing it lets nobody in
@@ -380,7 +400,8 @@ impl H2h {
         format!("{CODE_PREFIX}{}", BASE64URL_NOPAD.encode(t.to_string().as_bytes()))
     }
 
-    pub async fn add(&self, code: &str, name: Option<&str>) -> Result<String> {
+    pub async fn add(&self, code: &str, name: Option<&str>, share: Option<&str>) -> Result<String> {
+        let share = share.map(check_folder).transpose()?;
         let code = code.trim();
         if code.starts_with("ab1") {
             return Err(anyhow!("that's an old one-way invite; ask them for their contact code (agentbus h2h code)"));
@@ -395,6 +416,9 @@ impl H2h {
             return Err(anyhow!("that's your own code; add theirs"));
         }
         let c = self.add_contact(id, name.or(t["n"].as_str()).unwrap_or("friend"));
+        if let Some(folder) = &share {
+            self.db().execute("update h2h_contacts set workspace = ? where id = ?", params![folder.to_string_lossy(), c.id])?;
+        }
         if c.state == "connected" {
             return Ok(format!("{} is already a contact.", c.name));
         }
@@ -439,6 +463,18 @@ impl H2h {
             }
             _ => Err(anyhow!("level is one of normal, trusted, blocked, remove")),
         }
+    }
+
+    /// Sets the folder shared with one contact ("" goes back to the default from config).
+    pub fn share(&self, name: &str, folder: &str) -> Result<String> {
+        let c = self.contact_by_name(name)?;
+        let folder = if folder.is_empty() { None } else { Some(check_folder(folder)?.to_string_lossy().into_owned()) };
+        self.db().execute("update h2h_contacts set workspace = ? where id = ?", params![folder, c.id])?;
+        let c = self.contact_by_name(name)?;
+        Ok(match workspace_for(&c) {
+            Some(ws) => format!("{} can be answered from {} only; reads and changes anywhere else are refused.", c.name, tilde(&ws.to_string_lossy())),
+            None => format!("Nothing is shared with {} (no folder of their own and no default).", c.name),
+        })
     }
 
     // --- asking (outbound) ---------------------------------------------------------------------
@@ -614,7 +650,7 @@ impl H2h {
         })?;
         let exe = std::env::current_exe()?;
         let owner = owner_name();
-        let ws = workspace();
+        let ws = workspace_for(c).ok_or_else(|| anyhow!("{} hasn't shared any folder with you yet", owner_name()))?;
         let settings = json!({ "hooks": { "PreToolUse": [{ "matcher": "*", "hooks": [{
             "type": "command", "command": format!("'{}' hook h2h", exe.display()), "timeout": MANUAL_TIMEOUT.as_secs() + 60 }] }] } });
         let system = format!(
@@ -666,7 +702,7 @@ impl H2h {
             self.db().query_row("select contact, body from h2h_requests where rid = ? and status = 'running'", [rid], |r| Ok((r.get(0)?, r.get(1)?))).optional().ok().flatten();
         let Some((cid, body)) = req else { return (false, "no such running request".into()) };
         let Some(c) = self.contact_by_id(&cid) else { return (false, "contact removed".into()) };
-        let ws = workspace();
+        let Some(ws) = workspace_for(&c) else { return (false, format!("{} hasn't shared any folder with {}", owner_name(), c.name)) };
         let s = |k: &str| input[k].as_str().filter(|v| !v.is_empty());
         let (kind, resource, detail) = match tool {
             "Read" => ("read", s("file_path").map(|p| resolve(&ws, p)), String::new()),
@@ -689,6 +725,10 @@ impl H2h {
             if is_sensitive(&path) {
                 log("deny", "rule", None);
                 return (false, format!("{} is private and never shared", tilde(&res_str)));
+            }
+            if !path.starts_with(&ws) {
+                log("deny", "outside", None);
+                return (false, format!("only {} is shared; {} is outside it", tilde(&ws.to_string_lossy()), tilde(&res_str)));
             }
             if c.level == "trusted" && path.starts_with(&ws) {
                 log("allow", "trusted", None);
@@ -732,7 +772,12 @@ impl H2h {
                 }
             };
         }
-        // Writes, shell commands and anything else: always the owner, one call at a time.
+        // Writes, shell commands and anything else: always the owner, one call at a time. File changes outside the
+        // workspace aren't even offered.
+        if let Some(p) = resource.as_ref().filter(|p| kind == "write" && !p.starts_with(&ws)) {
+            log("deny", "outside", None);
+            return (false, format!("only {} is shared; {} is outside it", tilde(&ws.to_string_lossy()), tilde(&p.to_string_lossy())));
+        }
         match self.manual(&c, rid, kind, tool, &shown, &body, false).await {
             Choice::Deny => {
                 log("deny", "manual", None);
@@ -927,9 +972,11 @@ impl H2h {
                 };
                 Ok(json!({ "code": code, "text": text }))
             }
-            "h2h-add" => Ok(json!({ "text": self.add(&s("code"), Some(s("name")).filter(|n| !n.is_empty()).as_deref()).await? })),
+            "h2h-add" => Ok(json!({ "text": self.add(&s("code"), Some(s("name")).filter(|n| !n.is_empty()).as_deref(),
+                                                      Some(s("share")).filter(|f| !f.is_empty()).as_deref()).await? })),
             "h2h-contacts" => Ok(json!({ "text": self.contacts_text() })),
             "h2h-level" => Ok(json!({ "text": self.set_level(&s("name"), &s("level"))? })),
+            "h2h-share" => Ok(json!({ "text": self.share(&s("name"), &s("folder"))? })),
             "h2h-pending" => {
                 let items: Vec<Value> = self.pending.lock().unwrap().values().map(|p| p.info.clone()).collect();
                 let text = if items.is_empty() {
@@ -971,7 +1018,7 @@ impl H2h {
                             (_, Value::String(v)) => tilde(&v),
                             (_, Value::Number(n)) => n.to_string(),
                             ("name", _) => format!("{} (default)", owner_name()),
-                            ("workspace", _) => format!("{} (default)", tilde(&workspace().to_string_lossy())),
+                            ("workspace", _) => "none: only folders shared per person".into(),
                             _ => "-".into(),
                         };
                         format!("  {k:<14} {v:<32} {help}")
@@ -996,8 +1043,9 @@ impl H2h {
                     (_, Some(t)) => format!("seen {}", ago(t)),
                     _ => "never seen".into(),
                 };
+                let folder = workspace_for(c).map(|w| tilde(&w.to_string_lossy())).unwrap_or_else(|| "nothing shared".into());
                 format!(
-                    "  {}: {}, {seen}{}",
+                    "  {}: {}, {seen}, answers from {folder}{}",
                     c.name,
                     c.level,
                     if grants > 0 { format!(", {grants} shared folder(s)") } else { String::new() }
