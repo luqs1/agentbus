@@ -35,17 +35,20 @@ Your agents can ask *other people's* agents for things (what's in their notes, h
 ask yours. This runs over [iroh](https://www.iroh.computer): QUIC connections dialed by public key, with hole punching and
 n0's relays as a fallback, so **neither side needs Tailscale**, and the relays only ever see encrypted traffic.
 
-**Pairing** is one invite per person:
+**Connecting** is mutual: each of you adds the other's contact code (your device's public key and name).
 
 ```sh
-agentbus h2h invite          # prints a one-time ticket, valid 7 days
+agentbus h2h code                 # prints your code (not a secret) and the command for your friend
 # your friend, with nothing installed yet (macOS, Linux, WSL):
-curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh -s -- --join ab1… --name nikita
-# or, if they already have agentbus:
-agentbus h2h join ab1… --name nikita
+curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh -s -- --add ab2… --name nikita
+# ...which ends by printing *his* code. Or, if he already has agentbus: agentbus h2h add ab2…
+agentbus h2h add ab2…             # you add his code: now you're connected
 ```
 
-Creating the invite is your consent and redeeming it is theirs; there's nothing else to accept. From then on their agents
+Until both of you have added each other, neither daemon lets the other in. Every incoming connection is identified by
+the key it proves in the QUIC handshake, and keys you haven't added (or have blocked) are closed right after the
+handshake, before a byte of their request is read. So your code is safe to share: knowing it lets nobody in, and there
+are no invite secrets to leak. `agentbus h2h remove NAME` cuts someone off the same way. Once connected, their agents
 see you under "people" in `list_agents` and reach you with the `ask` tool (`agentbus ask luqmaan "…"` from a shell).
 
 **Answering.** A request from a contact is answered by a headless Claude Code (`claude -p`) in your workspace (your home
@@ -72,13 +75,14 @@ Every decision, automatic or yours, is in `agentbus h2h log` (and on the status 
 summarising the automatic ones after each answer.
 
 ```sh
+agentbus h2h code | add CODE [--as NAME]
 agentbus h2h contacts | trust NAME | normal NAME | block NAME | remove NAME
 agentbus h2h pending | approve ID [--always] | deny ID | log
 agentbus h2h config [name|workspace|responder|model|jev-threshold|typesafe-key VALUE]
 ```
 
 Limits: 30 requests per contact per hour; mail for an offline contact is queued and retried. A contact is one device
-(the one that paired); pair again from another machine if needed.
+(the one whose code you added); add their other machines' codes too if needed.
 
 ## Addresses
 
@@ -155,8 +159,7 @@ AGENTBUS_DEVICE=alpha AGENTBUS_PORT=7801 AGENTBUS_PEER_BIND=127.0.0.1 AGENTBUS_P
   AGENTBUS_PEERS=beta=http://127.0.0.1:7812 AGENTBUS_DB=/tmp/a.db target/release/agentbus daemon
 AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus send web.cli@beta hi --as api
 # h2h between them: AGENTBUS_NO_DIALOG=1 on the daemons lets you decide with `agentbus h2h approve|deny`
-AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus h2h invite
-AGENTBUS_URL=http://127.0.0.1:7802 target/release/agentbus h2h join ab1… --name bob
+AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus h2h code   # then `h2h add` it on the other, and vice versa
 ```
 
 Releases: push a `v*` tag; GitHub Actions builds static binaries for Linux (x86_64/arm64, musl) and macOS

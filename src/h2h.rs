@@ -1,7 +1,9 @@
 //! Human-to-human (h2h): your agents asking the agents of *other people*, over iroh (QUIC dialed by public key, NAT
 //! traversal, n0 relays as fallback), so neither side needs Tailscale.
 //!
-//! - **Pairing** is a one-time invite ticket: creating it is the inviter's consent, redeeming it the invitee's.
+//! - **Pairing** is mutual: each person adds the other's contact code (their device's public key). Until both have,
+//!   neither side's daemon lets the other in; connections from keys the owner hasn't added are closed right after the
+//!   handshake, before anything is read. Codes aren't secrets, so there's nothing to leak.
 //! - **Requests** from a contact are answered by a headless agent (`claude -p`) in the owner's workspace. Every tool
 //!   call it makes comes back here (`agentbus hook h2h` -> `authorize`) before it runs:
 //!   - reads: sensitive paths are refused; folders the owner "always allowed" for that person pass; otherwise a Jev
@@ -14,7 +16,7 @@ use crate::util::*;
 use anyhow::{anyhow, Result};
 use data_encoding::BASE64URL_NOPAD;
 use iroh::{
-    endpoint::{presets, Connection},
+    endpoint::{presets, AfterHandshakeOutcome, Connection, EndpointHooks, Side},
     protocol::{AcceptError, ProtocolHandler, Router},
     Endpoint, EndpointId, SecretKey,
 };
@@ -28,8 +30,8 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 pub const ALPN: &[u8] = b"agentbus/h2h/1";
-const TICKET_PREFIX: &str = "ab1";
-const INVITE_TTL_MS: i64 = 7 * 86_400_000;
+const CODE_PREFIX: &str = "ab2";
+const NOT_ADDED: &[u8] = b"not a contact";
 const ASKS_PER_HOUR: i64 = 30;
 const MANUAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const RESPONDER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -78,11 +80,13 @@ pub struct Contact {
     pub id: String,
     pub name: String,
     pub level: String,
+    /// "waiting": we added them, they haven't added us yet; "connected": both have.
+    pub state: String,
     pub last_seen: Option<i64>,
 }
 
 fn contact_row(r: &rusqlite::Row) -> rusqlite::Result<Contact> {
-    Ok(Contact { id: r.get("id")?, name: r.get("name")?, level: r.get("level")?, last_seen: r.get("last_seen")? })
+    Ok(Contact { id: r.get("id")?, name: r.get("name")?, level: r.get("level")?, state: r.get("state")?, last_seen: r.get("last_seen")? })
 }
 
 // --- config -----------------------------------------------------------------------------------
@@ -179,17 +183,23 @@ pub async fn start(d: Arc<Daemon>) -> Result<()> {
         db.execute_batch(
             "create table if not exists h2h_contacts (id text primary key, name text unique, level text not null default 'normal',
                created_at integer, last_seen integer);
-             create table if not exists h2h_invites (secret text primary key, created_at integer, used_by text);
              create table if not exists h2h_requests (rid text primary key, contact text, from_addr text, reply_mid text, body text,
                status text, answer text, created_at integer, finished_at integer);
              create table if not exists h2h_log (id integer primary key, rid text, contact text, kind text, tool text, resource text,
                decision text, by text, score real, created_at integer);
              create table if not exists h2h_grants (contact text, prefix text, created_at integer, primary key (contact, prefix));",
         )?;
+        // 0.4.0 paired both ways in one step, so its contacts are already mutual.
+        let _ = db.execute("alter table h2h_contacts add column state text not null default 'connected'", []);
         // Responders that were running when the daemon stopped won't finish.
         db.execute("update h2h_requests set status = 'failed', finished_at = ? where status = 'running'", [now_ms()])?;
     }
-    let ep = Endpoint::builder(presets::N0).secret_key(load_key()?).bind().await.map_err(|e| anyhow!("iroh: {e}"))?;
+    let ep = Endpoint::builder(presets::N0)
+        .secret_key(load_key()?)
+        .hooks(Gate { d: d.clone() })
+        .bind()
+        .await
+        .map_err(|e| anyhow!("iroh: {e}"))?;
     let router = Router::builder(ep).accept(ALPN, Handler).spawn();
     let h = Arc::new(H2h { d, router, pending: Mutex::default(), flushing: AtomicBool::new(false) });
     let _ = H2H.set(h.clone());
@@ -200,6 +210,40 @@ pub async fn start(d: Arc<Daemon>) -> Result<()> {
         me.flush().await;
     });
     Ok(())
+}
+
+/// Closes incoming connections from keys the owner hasn't added (or has blocked) right after the TLS handshake,
+/// before a byte of their request is read. The handshake itself proves who the key belongs to.
+struct Gate {
+    d: Arc<Daemon>,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gate")
+    }
+}
+
+impl EndpointHooks for Gate {
+    async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        if conn.side() != Side::Server {
+            return AfterHandshakeOutcome::accept(); // our own outgoing calls
+        }
+        let id = conn.remote_id().to_string();
+        let known: bool = self
+            .d
+            .db
+            .lock()
+            .unwrap()
+            .query_row("select count(*) from h2h_contacts where id = ? and level != 'blocked'", [&id], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+            > 0;
+        if known {
+            AfterHandshakeOutcome::accept()
+        } else {
+            AfterHandshakeOutcome::Reject { error_code: 403u32.into(), reason: NOT_ADDED.to_vec() }
+        }
+    }
 }
 
 // --- wire protocol: one bi-stream per call, a JSON request and a JSON response ------------------
@@ -238,11 +282,16 @@ impl H2h {
         let conn = tokio::time::timeout(Duration::from_secs(20), ep.connect(id, ALPN))
             .await
             .map_err(|_| anyhow!("unreachable (timed out)"))?
-            .map_err(|e| anyhow!("unreachable ({e})"))?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        send.write_all(&serde_json::to_vec(req)?).await?;
+            .map_err(|e| not_added_or(e, "unreachable"))?;
+        // A rejection from their Gate arrives as the connection's close reason, not in the stream error.
+        let why = |e: &dyn std::fmt::Display| format!("{e}; {:?}", conn.close_reason());
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| not_added_or(why(&e), "unreachable"))?;
+        send.write_all(&serde_json::to_vec(req)?).await.map_err(|e| not_added_or(why(&e), "unreachable"))?;
         send.finish()?;
-        let raw = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(1 << 20)).await.map_err(|_| anyhow!("no reply"))??;
+        let raw = tokio::time::timeout(Duration::from_secs(30), recv.read_to_end(1 << 20))
+            .await
+            .map_err(|_| anyhow!("no reply"))?
+            .map_err(|e| not_added_or(why(&e), "no reply"))?;
         conn.close(0u32.into(), b"done");
         let v: Value = serde_json::from_slice(&raw)?;
         match v["error"].as_str() {
@@ -251,25 +300,32 @@ impl H2h {
         }
     }
 
+    /// Only contacts the owner added get this far (see `Gate`).
     async fn handle(self: &Arc<Self>, from: EndpointId, raw: &[u8]) -> Result<Value> {
         let req: Value = serde_json::from_slice(raw)?;
-        let from = from.to_string();
-        if req["t"] == "pair" {
-            return self.accept_pair(&from, &req);
-        }
-        let c = self.contact_by_id(&from).ok_or_else(|| anyhow!("not paired with {}", owner_name()))?;
+        let c = self.contact_by_id(&from.to_string()).ok_or_else(|| anyhow!("not a contact"))?;
         if c.level == "blocked" {
-            return Err(anyhow!("{} isn't accepting requests from you", owner_name()));
+            return Err(anyhow!("not a contact"));
         }
-        let _ = self.db().execute("update h2h_contacts set last_seen = ? where id = ?", params![now_ms(), c.id]);
+        // They reached us, so they've added us too: the pairing is mutual.
+        self.connected(&c);
         match req["t"].as_str() {
+            Some("hello") => Ok(json!({ "ok": true, "name": owner_name() })),
             Some("ask") => self.accept_ask(&c, &req),
             Some("answer") => self.accept_answer(&c, &req),
             _ => Err(anyhow!("unknown request")),
         }
     }
 
-    // --- contacts and pairing ------------------------------------------------------------------
+    fn connected(&self, c: &Contact) {
+        let _ = self.db().execute("update h2h_contacts set last_seen = ?, state = 'connected' where id = ?", params![now_ms(), c.id]);
+        if c.state == "waiting" {
+            println!("h2h: connected with {}", c.name);
+            notify_banner("agentbus", &format!("Connected with {}. Their agents can now ask yours: reads follow your rules, changes need your OK.", c.name));
+        }
+    }
+
+    // --- contacts: both people add each other's code ----------------------------------------------
 
     pub fn contacts(&self) -> Vec<Contact> {
         let db = self.db();
@@ -288,19 +344,19 @@ impl H2h {
         found.ok_or_else(|| {
             let known: Vec<String> = self.contacts().into_iter().map(|c| c.name).collect();
             if known.is_empty() {
-                anyhow!("no person \"{name}\": you haven't paired with anyone yet (agentbus h2h invite)")
+                anyhow!("no person \"{name}\": you haven't added anyone yet (agentbus h2h add <their code>)")
             } else {
-                anyhow!("no person \"{name}\"; paired with: {}", known.join(", "))
+                anyhow!("no person \"{name}\"; your contacts: {}", known.join(", "))
             }
         })
     }
 
-    /// Stores (or refreshes) a contact, keeping names unique.
-    fn add_contact(&self, id: &str, name: &str) -> String {
-        let db = self.db();
-        if let Ok(existing) = db.query_row("select name from h2h_contacts where id = ?", [id], |r| r.get::<_, String>(0)) {
-            return existing;
+    /// Stores a contact as "waiting" (until they've added us too), keeping names unique.
+    fn add_contact(&self, id: &str, name: &str) -> Contact {
+        if let Some(c) = self.contact_by_id(id) {
+            return c;
         }
+        let db = self.db();
         let base = Some(slug(name)).filter(|n| !n.is_empty()).unwrap_or_else(|| "friend".into());
         let mut name = base.clone();
         for i in 2.. {
@@ -310,54 +366,58 @@ impl H2h {
             }
             name = format!("{base}-{i}");
         }
-        let _ = db.execute("insert into h2h_contacts (id, name, level, created_at, last_seen) values (?, ?, 'normal', ?, ?)", params![id, name, now_ms(), now_ms()]);
-        name
+        let _ = db.execute(
+            "insert into h2h_contacts (id, name, level, state, created_at) values (?, ?, 'normal', 'waiting', ?)",
+            params![id, name, now_ms()],
+        );
+        Contact { id: id.into(), name, level: "normal".into(), state: "waiting".into(), last_seen: None }
     }
 
-    pub fn invite(&self) -> Result<String> {
-        let secret = format!("{:016x}{:016x}", rand::random::<u64>(), rand::random::<u64>());
-        self.db().execute("insert into h2h_invites (secret, created_at) values (?, ?)", params![secret, now_ms()])?;
-        let t = json!({ "id": self.id(), "s": secret, "n": owner_name() });
-        Ok(format!("{TICKET_PREFIX}{}", BASE64URL_NOPAD.encode(t.to_string().as_bytes())))
+    /// This device's contact code: its public key and the owner's name. Not a secret: knowing it lets nobody in
+    /// until the owner adds *their* code too.
+    pub fn code(&self) -> String {
+        let t = json!({ "id": self.id(), "n": owner_name() });
+        format!("{CODE_PREFIX}{}", BASE64URL_NOPAD.encode(t.to_string().as_bytes()))
     }
 
-    fn accept_pair(&self, from: &str, req: &Value) -> Result<Value> {
-        let secret = req["secret"].as_str().unwrap_or("");
-        let ok: bool = {
-            let db = self.db();
-            let n = db.execute(
-                "update h2h_invites set used_by = ? where secret = ? and used_by is null and created_at > ?",
-                params![from, secret, now_ms() - INVITE_TTL_MS],
-            )?;
-            n == 1
-        };
-        if !ok {
-            return Err(anyhow!("this invite has expired or was already used; ask for a new one"));
+    pub async fn add(&self, code: &str, name: Option<&str>) -> Result<String> {
+        let code = code.trim();
+        if code.starts_with("ab1") {
+            return Err(anyhow!("that's an old one-way invite; ask them for their contact code (agentbus h2h code)"));
         }
-        let name = self.add_contact(from, req["name"].as_str().unwrap_or("friend"));
-        println!("h2h: paired with {name} ({from})");
-        notify_banner("agentbus", &format!("Paired with {name}. Their agents can now ask yours; reads follow your rules and changes need your OK."));
-        Ok(json!({ "ok": true, "name": owner_name() }))
-    }
-
-    pub async fn join(&self, ticket: &str, name: Option<&str>) -> Result<String> {
-        let raw = ticket.trim().strip_prefix(TICKET_PREFIX).ok_or_else(|| anyhow!("not an agentbus invite (should start with {TICKET_PREFIX})"))?;
-        let t: Value = serde_json::from_slice(&BASE64URL_NOPAD.decode(raw.as_bytes()).map_err(|_| anyhow!("invite is damaged; copy it again"))?)?;
-        let (id, secret) = (t["id"].as_str().unwrap_or(""), t["s"].as_str().unwrap_or(""));
+        let raw = code.strip_prefix(CODE_PREFIX).ok_or_else(|| anyhow!("not an agentbus contact code (should start with {CODE_PREFIX})"))?;
+        let t: Value = serde_json::from_slice(&BASE64URL_NOPAD.decode(raw.as_bytes()).map_err(|_| anyhow!("code is damaged; copy it again"))?)?;
+        let id = t["id"].as_str().unwrap_or("");
+        if id.parse::<EndpointId>().is_err() {
+            return Err(anyhow!("code is damaged; copy it again"));
+        }
         if id == self.id() {
-            return Err(anyhow!("that's your own invite"));
+            return Err(anyhow!("that's your own code; add theirs"));
         }
-        if let Some(n) = name {
-            set_config("name", &slug(n))?;
+        let c = self.add_contact(id, name.or(t["n"].as_str()).unwrap_or("friend"));
+        if c.state == "connected" {
+            return Ok(format!("{} is already a contact.", c.name));
         }
-        let r = self.call(id, &json!({ "t": "pair", "secret": secret, "name": owner_name() })).await?;
-        let their = r["name"].as_str().or(t["n"].as_str()).unwrap_or("friend");
-        let saved = self.add_contact(id, their);
-        Ok(format!(
-            "Paired with {saved}. Your agents can ask them with the agentbus `ask` tool (to=\"{saved}\"), and theirs can ask yours: \
-             reads follow your rules, anything that changes files needs your OK. You appear to them as \"{}\".",
-            owner_name()
-        ))
+        Ok(match self.hello(&c).await {
+            Ok(()) => format!(
+                "Connected with {n}: you've both added each other. Your agents can ask {n} with the agentbus `ask` tool, and theirs can ask yours: \
+                 reads follow your rules, anything that changes files needs your OK.",
+                n = c.name
+            ),
+            Err(_) => format!(
+                "Added {n}. Nothing can pass either way until {n} adds you too; send them your code:\n\n  {code}\n\n\
+                 (they run: agentbus h2h add {code})\nYou'll get a notification when you're connected.",
+                n = c.name,
+                code = self.code()
+            ),
+        })
+    }
+
+    /// Checks whether a waiting contact has added us yet; marks them connected if so.
+    async fn hello(&self, c: &Contact) -> Result<()> {
+        self.call(&c.id, &json!({ "t": "hello", "name": owner_name() })).await?;
+        self.connected(c);
+        Ok(())
     }
 
     pub fn set_level(&self, name: &str, level: &str) -> Result<String> {
@@ -385,6 +445,9 @@ impl H2h {
 
     pub async fn ask(&self, a: &Agent, to: &str, question: &str) -> Result<String> {
         let c = self.contact_by_name(to)?;
+        if c.state == "waiting" && self.hello(&c).await.is_err() {
+            return Err(anyhow!("{} hasn't added you yet, so nothing can reach them. Ask them to run: agentbus h2h add {}", c.name, self.code()));
+        }
         if question.trim().is_empty() {
             return Err(anyhow!("question is empty"));
         }
@@ -406,6 +469,9 @@ impl H2h {
             }
             Err(e) if is_refusal(&e) => {
                 self.mark(&mid, "failed");
+                if e.to_string().contains("haven't added you") {
+                    let _ = self.db().execute("update h2h_contacts set state = 'waiting' where id = ?", [&c.id]);
+                }
                 return Err(e);
             }
             Err(e) => format!(" {} is offline right now ({e}); it's queued and goes out when they're back.", c.name),
@@ -442,6 +508,9 @@ impl H2h {
     pub async fn flush(&self) {
         if self.flushing.swap(true, Ordering::SeqCst) {
             return;
+        }
+        for c in self.contacts().into_iter().filter(|c| c.state == "waiting" && c.level != "blocked") {
+            let _ = self.hello(&c).await;
         }
         let rows: Vec<(String, String, String, String, Option<String>, String)> = {
             let db = self.db();
@@ -841,15 +910,24 @@ impl H2h {
                 let (allow, reason) = self.authorize(&s("rid"), &s("tool"), p.get("input").unwrap_or(&Value::Null)).await;
                 Ok(json!({ "allow": allow, "reason": reason }))
             }
-            "h2h-invite" => {
-                let t = self.invite()?;
-                Ok(json!({ "ticket": t, "text": format!(
-                    "Invite for one person, valid for 7 days. They install agentbus and pair in one step (macOS, Linux, or WSL; no Tailscale needed):\n\n  \
-                     curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh -s -- --join {t}\n\n\
-                     If they already have agentbus:\n\n  agentbus h2h join {t}\n\n\
-                     You appear to them as \"{}\" (change with: agentbus h2h config name <name>).", owner_name()) }))
+            "h2h-code" => {
+                let code = self.code();
+                let text = if s("short") == "1" {
+                    format!("Your contact code (send it back so they can add you):\n\n  {code}")
+                } else {
+                    format!(
+                        "Your contact code, as {}. It's safe to share: it only identifies you, and nobody can reach your agents \
+                         until you add their code too.\n\n  {code}\n\n\
+                         Someone without agentbus installs it and adds you in one step (macOS, Linux or WSL; no Tailscale needed):\n\n  \
+                         curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh -s -- --add {code} --name <their name>\n\n\
+                         If they already have it: agentbus h2h add {code}\n\
+                         Then they send you their code and you run: agentbus h2h add <their code>",
+                        owner_name()
+                    )
+                };
+                Ok(json!({ "code": code, "text": text }))
             }
-            "h2h-join" => Ok(json!({ "text": self.join(&s("ticket"), Some(s("name")).filter(|n| !n.is_empty()).as_deref()).await? })),
+            "h2h-add" => Ok(json!({ "text": self.add(&s("code"), Some(s("name")).filter(|n| !n.is_empty()).as_deref()).await? })),
             "h2h-contacts" => Ok(json!({ "text": self.contacts_text() })),
             "h2h-level" => Ok(json!({ "text": self.set_level(&s("name"), &s("level"))? })),
             "h2h-pending" => {
@@ -908,16 +986,20 @@ impl H2h {
     pub fn contacts_text(&self) -> String {
         let cs = self.contacts();
         if cs.is_empty() {
-            return "No contacts yet. Invite someone: agentbus h2h invite".into();
+            return "No contacts yet. Share your code (agentbus h2h code) and add theirs (agentbus h2h add <code>).".into();
         }
         cs.iter()
             .map(|c| {
                 let grants: i64 = self.db().query_row("select count(*) from h2h_grants where contact = ?", [&c.id], |r| r.get(0)).unwrap_or(0);
+                let seen = match (c.state.as_str(), c.last_seen) {
+                    ("waiting", _) => "waiting for them to add you".to_string(),
+                    (_, Some(t)) => format!("seen {}", ago(t)),
+                    _ => "never seen".into(),
+                };
                 format!(
-                    "  {}: {}, seen {}{}",
+                    "  {}: {}, {seen}{}",
                     c.name,
                     c.level,
-                    c.last_seen.map(ago).unwrap_or_else(|| "never".into()),
                     if grants > 0 { format!(", {grants} shared folder(s)") } else { String::new() }
                 )
             })
@@ -927,12 +1009,12 @@ impl H2h {
 
     /// The "People" part of list_agents.
     pub fn people_text(&self) -> Option<String> {
-        let cs: Vec<Contact> = self.contacts().into_iter().filter(|c| c.level != "blocked").collect();
+        let cs: Vec<Contact> = self.contacts().into_iter().filter(|c| c.level != "blocked" && c.state == "connected").collect();
         if cs.is_empty() {
             return None;
         }
         let names: Vec<String> = cs.iter().map(|c| format!("  {} (seen {})", c.name, c.last_seen.map(ago).unwrap_or_else(|| "never".into()))).collect();
-        Some(format!("people you've paired with (reach them with the ask tool, not send)\n{}", names.join("\n")))
+        Some(format!("people (reach them with the ask tool, not send)\n{}", names.join("\n")))
     }
 
     pub fn log_text(&self, limit: i64) -> String {
@@ -965,6 +1047,16 @@ impl H2h {
             .filter_map(|r| r.ok())
             .collect();
         if rows.is_empty() { "No h2h activity yet.".into() } else { rows.join("\n") }
+    }
+}
+
+/// Their daemon closed the connection because it doesn't know our key (they haven't added us, or removed us).
+fn not_added_or(e: impl std::fmt::Display, otherwise: &str) -> anyhow::Error {
+    let s = e.to_string();
+    if s.contains(std::str::from_utf8(NOT_ADDED).unwrap_or("")) || s.contains("error_code: 403") || s.contains("code: 403") {
+        anyhow!("they haven't added you as a contact (or removed you)")
+    } else {
+        anyhow!("{otherwise} ({s})")
     }
 }
 
