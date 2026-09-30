@@ -283,7 +283,9 @@ impl H2h {
 
     pub fn contact_by_name(&self, name: &str) -> Result<Contact> {
         let n = slug(name);
-        self.db().query_row("select * from h2h_contacts where name = ?", [&n], contact_row).optional()?.ok_or_else(|| {
+        // Bind first: the guard from self.db() must be gone before the error path calls contacts() (std Mutex isn't reentrant).
+        let found = self.db().query_row("select * from h2h_contacts where name = ?", [&n], contact_row).optional()?;
+        found.ok_or_else(|| {
             let known: Vec<String> = self.contacts().into_iter().map(|c| c.name).collect();
             if known.is_empty() {
                 anyhow!("no person \"{name}\": you haven't paired with anyone yet (agentbus h2h invite)")
