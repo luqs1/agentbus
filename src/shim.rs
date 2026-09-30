@@ -124,6 +124,9 @@ pub fn hook(harness: &str) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input)?;
     let Ok(ev) = serde_json::from_str::<Value>(&input) else { return Ok(()) };
+    if harness == "h2h" {
+        return h2h_hook(&ev);
+    }
     let harness = slug(harness);
     let q = query(&[
         ("key", format!("{harness}:{}", ev["session_id"].as_str().unwrap_or(""))),
@@ -153,5 +156,19 @@ pub fn hook(harness: &str) -> Result<()> {
     if let Some(o) = out {
         println!("{o}");
     }
+    Ok(())
+}
+
+/// PreToolUse hook of an h2h responder: every tool call waits for the daemon's decision (which may be a person clicking
+/// a dialog). Fails closed.
+fn h2h_hook(ev: &Value) -> Result<()> {
+    let rid = std::env::var("AGENTBUS_H2H_REQ").unwrap_or_default();
+    let body = json!({ "rid": rid, "tool": ev["tool_name"], "input": ev["tool_input"] });
+    let (allow, reason) = match post_json(&format!("{}/api/h2h-authorize", local_url()), &body, Duration::from_secs(20 * 60)) {
+        Ok(r) => (r["allow"] == true, r["reason"].as_str().unwrap_or("").to_string()),
+        Err(e) => (false, format!("agentbus couldn't check permissions: {e}")),
+    };
+    println!("{}", json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse",
+        "permissionDecision": if allow { "allow" } else { "deny" }, "permissionDecisionReason": reason } }));
     Ok(())
 }

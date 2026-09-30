@@ -1,7 +1,8 @@
 # agentbus
 
-Peer-to-peer messaging between AI coding agents (Claude Code, Codex, OpenCode, pi), on one machine and across
-your Tailscale tailnet. No central hub: every device runs its own small daemon. One ~3 MB static binary.
+Peer-to-peer messaging between AI coding agents (Claude Code, Codex, OpenCode, pi), on one machine, across your
+Tailscale tailnet, and with **other people's** agents over iroh ([h2h](#people-h2h)). No central hub: every device runs
+its own small daemon. One ~5 MB static binary.
 
 ```sh
 curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent: "install luqmaan.dev/agentbus"
@@ -27,6 +28,57 @@ curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent:
 - **Trust is Tailscale.** The peer port only accepts devices that `tailscale whois` says belong to the same user.
 - **Mailboxes live on the recipient's device.** Mail for an offline device is queued by the sender's daemon and
   delivered when Tailscale reports it back.
+
+## People (h2h)
+
+Your agents can ask *other people's* agents for things (what's in their notes, how they solved something), and theirs can
+ask yours. This runs over [iroh](https://www.iroh.computer): QUIC connections dialed by public key, with hole punching and
+n0's relays as a fallback, so **neither side needs Tailscale**, and the relays only ever see encrypted traffic.
+
+**Pairing** is one invite per person:
+
+```sh
+agentbus h2h invite          # prints a one-time ticket, valid 7 days
+# your friend, with nothing installed yet (macOS, Linux, WSL):
+curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh -s -- --join ab1… --name nikita
+# or, if they already have agentbus:
+agentbus h2h join ab1… --name nikita
+```
+
+Creating the invite is your consent and redeeming it is theirs; there's nothing else to accept. From then on their agents
+see you under "people" in `list_agents` and reach you with the `ask` tool (`agentbus ask luqmaan "…"` from a shell).
+
+**Answering.** A request from a contact is answered by a headless Claude Code (`claude -p`) in your workspace (your home
+folder by default; `agentbus h2h config workspace ~/notes`). It gets only Read/Grep/Glob/Edit/Write/Bash, none of your MCP
+servers or settings, and a system prompt that frames the request as coming from that person. Its final message goes back
+to the asking agent's inbox.
+
+**Permissions.** Every tool call the responder makes is checked by your daemon before it runs (a `PreToolUse` hook,
+`agentbus hook h2h`, that fails closed):
+
+| Action | Decision |
+|---|---|
+| Read a sensitive path (`~/.ssh`, `~/.aws`, `~/.claude`, `.env`, `*.pem`, agentbus's own data, …) | always denied |
+| Read inside a folder you "always allowed" for that person | allowed, logged |
+| Read, contact marked `trusted`, inside the workspace | allowed, logged |
+| Any other read | [Jev](https://docs.typesafe.ai) judges it from your past manual decisions; allowed if confident (≥ 0.85), else **asks you** |
+| Write, edit, shell command, anything else | **always asks you**, one call at a time |
+| An answer that looks like it contains a credential | asks you before it's sent |
+
+Asking you means a native dialog on macOS (Deny / Allow / Always allow folder; a notification on Linux), or
+`agentbus h2h pending` + `agentbus h2h approve|deny <id>` from any terminal. Unanswered requests are denied after 15
+minutes. Jev needs a TypeSafe key (`agentbus h2h config typesafe-key …`); without one, reads that no grant covers ask you.
+Every decision, automatic or yours, is in `agentbus h2h log` (and on the status page), and you get a notification
+summarising the automatic ones after each answer.
+
+```sh
+agentbus h2h contacts | trust NAME | normal NAME | block NAME | remove NAME
+agentbus h2h pending | approve ID [--always] | deny ID | log
+agentbus h2h config [name|workspace|responder|model|jev-threshold|typesafe-key VALUE]
+```
+
+Limits: 30 requests per contact per hour; mail for an offline contact is queued and retried. A contact is one device
+(the one that paired); pair again from another machine if needed.
 
 ## Addresses
 
@@ -76,6 +128,7 @@ New-NetFirewallHyperVRule -Name agentbus -DisplayName "agentbus (WSL)" -Directio
 ## What `install` changes
 
 - a user systemd unit (Linux/WSL, plus `loginctl enable-linger`) or launchd agent (macOS) running `agentbus daemon`
+- `~/.local/share/agentbus/iroh.key`: this device's h2h identity (created on first start)
 - Claude: user-scope MCP server `agentbus`
 - Codex: `[mcp_servers.agentbus]` (auto-approved tools, 660 s timeout) + `hooks.json`; Codex asks you to trust new hooks
 - OpenCode: `mcp.agentbus` in `opencode.json`
@@ -101,6 +154,9 @@ cargo build --release
 AGENTBUS_DEVICE=alpha AGENTBUS_PORT=7801 AGENTBUS_PEER_BIND=127.0.0.1 AGENTBUS_PEER_PORT=7811 \
   AGENTBUS_PEERS=beta=http://127.0.0.1:7812 AGENTBUS_DB=/tmp/a.db target/release/agentbus daemon
 AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus send web.cli@beta hi --as api
+# h2h between them: AGENTBUS_NO_DIALOG=1 on the daemons lets you decide with `agentbus h2h approve|deny`
+AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus h2h invite
+AGENTBUS_URL=http://127.0.0.1:7802 target/release/agentbus h2h join ab1… --name bob
 ```
 
 Releases: push a `v*` tag; GitHub Actions builds static binaries for Linux (x86_64/arm64, musl) and macOS

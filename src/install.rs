@@ -264,7 +264,8 @@ pub fn install(no_service: bool) -> Result<()> {
     }
 
     if tailscale_bin().is_none() {
-        println!("\nWARNING: tailscale CLI not found; the daemon runs local-only until Tailscale is installed and logged in.");
+        println!("\nNo Tailscale here: agents on this machine can talk to each other, and to people you pair with (agentbus h2h),");
+        println!("but not to agents on your other machines until Tailscale is installed and logged in.");
     }
     if is_wsl() {
         println!("\nWSL: its Hyper-V firewall blocks inbound connections by default, so other devices can't reach this one until,");
