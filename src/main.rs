@@ -61,11 +61,22 @@ enum Cmd {
         #[arg(long = "as")]
         as_: Option<String>,
     },
+    /// Send a file to a person you've paired with (you confirm it in a dialog)
+    SendFile {
+        to: String,
+        path: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long = "as")]
+        as_: Option<String>,
+    },
     /// People: pair with other people's agentbus and control what their agents may do here
     H2h {
         #[command(subcommand)]
         cmd: H2hCmd,
     },
+    /// Install the latest agentbus release (same as re-running the installer)
+    Upgrade,
     /// Daemons found on the tailnet
     Peers,
     /// Is this device's daemon running?
@@ -125,6 +136,22 @@ enum H2hCmd {
     },
     /// Deny a pending request
     Deny { id: String },
+    /// Files received from contacts, and files offered to them
+    Files,
+    /// Add a plain-English rule Jev applies to reads and file copies (it decides when confident and notifies you)
+    Rule {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// Only for this person (default: everyone)
+        #[arg(long = "for")]
+        for_: Option<String>,
+    },
+    /// Your plain-English rules
+    Rules,
+    /// Remove a rule by its number
+    Unrule { id: String },
+    /// Withdraw "always allowed" folders from someone (all of them, or one)
+    Ungrant { name: String, folder: Option<String> },
     /// Every decision on contacts' requests, automatic ones included
     Log {
         #[arg(long, default_value_t = 30)]
@@ -161,6 +188,14 @@ fn h2h(cmd: H2hCmd) -> Result<()> {
         H2hCmd::Pending => h2h_call("h2h-pending", json!({}), t),
         H2hCmd::Approve { id, always } => h2h_call("h2h-resolve", json!({ "id": id, "choice": if always { "always" } else { "allow" } }), t),
         H2hCmd::Deny { id } => h2h_call("h2h-resolve", json!({ "id": id, "choice": "deny" }), t),
+        H2hCmd::Files => h2h_call("h2h-files", json!({}), t),
+        H2hCmd::Rule { text, for_ } => h2h_call("h2h-rule", json!({ "text": text.join(" "), "for": for_ }), t),
+        H2hCmd::Rules => h2h_call("h2h-rules", json!({}), t),
+        H2hCmd::Unrule { id } => h2h_call("h2h-unrule", json!({ "id": id }), t),
+        H2hCmd::Ungrant { name, folder } => {
+            let folder = folder.map(|f| std::fs::canonicalize(expand_home(&f)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(f)).unwrap_or_default();
+            h2h_call("h2h-ungrant", json!({ "name": name, "folder": folder }), t)
+        }
         H2hCmd::Log { limit } => h2h_call("h2h-log", json!({ "limit": limit.to_string() }), t),
         H2hCmd::Config { key, value } => {
             if key.is_some() && value.is_none() {
@@ -221,6 +256,28 @@ fn main() {
                 Ok(())
             }
             Cmd::H2h { cmd } => h2h(cmd),
+            Cmd::Upgrade => {
+                println!("agentbus {}: installing the latest release...", env!("CARGO_PKG_VERSION"));
+                let st = std::process::Command::new("sh").args(["-c", "curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh"]).status()?;
+                if !st.success() {
+                    return Err(anyhow!("upgrade failed"));
+                }
+                let v = std::process::Command::new(home().join(".local/share/agentbus/bin/agentbus")).arg("--version").output()?;
+                println!("\nNow {}Restart agent sessions to load any new tools.", String::from_utf8_lossy(&v.stdout));
+                Ok(())
+            }
+            Cmd::SendFile { to, path, note, as_ } => {
+                let mut body = serde_json::Map::new();
+                for (k, v) in identity(as_) {
+                    body.insert(k.into(), json!(v));
+                }
+                let path = std::fs::canonicalize(&path).map(|p| p.to_string_lossy().into_owned()).unwrap_or(path);
+                body.insert("to".into(), json!(to));
+                body.insert("path".into(), json!(path));
+                body.insert("note".into(), json!(note));
+                println!("{}", post_json(&format!("{base}/api/send-file"), &body.into(), Duration::from_secs(20 * 60))?["text"].as_str().unwrap_or(""));
+                Ok(())
+            }
             Cmd::Ask { to, question, as_ } => {
                 let mut body = serde_json::Map::new();
                 for (k, v) in identity(as_) {
@@ -238,6 +295,9 @@ fn main() {
                 println!("agentbus {} on {}: ok ({base})", h["version"].as_str().unwrap_or("?"), h["device"].as_str().unwrap_or("?"));
                 if let Some(id) = h["h2h"]["id"].as_str() {
                     println!("h2h: {id} as {}", h["h2h"]["name"].as_str().unwrap_or("?"));
+                }
+                if let Some(u) = h["update"].as_str() {
+                    println!("{u}");
                 }
                 Ok(())
             }

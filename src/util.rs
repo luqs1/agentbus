@@ -8,6 +8,37 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_PORT: u16 = 7777;
+
+/// The newest agentbus release the daemon has seen (checked twice a day), if newer than this build.
+pub static LATEST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub fn newer(latest: &str, current: &str) -> bool {
+    let v = |s: &str| s.trim_start_matches('v').split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    v(latest) > v(current)
+}
+
+/// "agentbus 0.5.1 is available ..." when a newer release exists, for agents and the CLI.
+pub fn update_notice() -> Option<String> {
+    let latest = LATEST.lock().unwrap().clone()?;
+    newer(&latest, env!("CARGO_PKG_VERSION")).then(|| {
+        format!("agentbus {latest} is available (this is {}): run `agentbus upgrade` to install it.", env!("CARGO_PKG_VERSION"))
+    })
+}
+
+/// Asks GitHub for the latest release tag.
+pub fn check_latest() {
+    let tag = agent()
+        .get("https://api.github.com/repos/luqs1/agentbus/releases/latest")
+        .set("user-agent", concat!("agentbus/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(15))
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<Value>().ok())
+        .and_then(|v| v["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string()));
+    if let Some(t) = tag {
+        *LATEST.lock().unwrap() = Some(t);
+    }
+}
 pub const ACTIVE_MS: i64 = 30 * 60_000;
 
 pub fn port() -> u16 {

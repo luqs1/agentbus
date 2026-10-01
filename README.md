@@ -58,28 +58,40 @@ servers or settings, and a system prompt that frames the request as coming from 
 to the asking agent's inbox.
 
 **Permissions.** Every tool call the responder makes is checked by your daemon before it runs (a `PreToolUse` hook,
-`agentbus hook h2h`, that fails closed):
+`agentbus hook h2h`, that fails closed). There are three tiers:
 
-| Action | Decision |
-|---|---|
-| Read a sensitive path (`~/.ssh`, `~/.aws`, `~/.claude`, `.env`, `*.pem`, agentbus's own data, …) | always denied |
-| Read or change anything outside the folder shared with that person | always denied |
-| Read inside a folder you "always allowed" for that person | allowed, logged |
-| Read, contact marked `trusted`, inside their folder | allowed, logged |
-| Any other read | [Jev](https://docs.typesafe.ai) judges it from your past manual decisions; allowed if confident (≥ 0.85), else **asks you** |
-| Write, edit, shell command, anything else | **always asks you**, one call at a time |
-| An answer that looks like it contains a credential | asks you before it's sent |
+1. **Folders you always allow** for that person (the "Always allow folder" button, or everything for a `trusted`
+   contact): reads there just happen, and are logged.
+2. **Your plain-English rules**, judged by [Jev](https://docs.typesafe.ai) together with your past manual decisions:
+   `agentbus h2h rule "nikita can read anything about manufacturing" --for nikita`,
+   `agentbus h2h rule "never share anything personal or financial"`. When Jev is confident (≥ 0.85) it allows or denies
+   on its own, and you get a notification listing what it decided. When it isn't, it falls through to you. Jev sees the
+   person, their request, the file's path inside the shared folder and its first ~600 characters, never the whole file.
+3. **You**: anything else, and *always* for writes, edits, shell commands and other tools, one call at a time.
+
+Before any of that, two fixed rules apply: nothing outside the folder shared with that person is ever read or changed,
+and sensitive paths (`~/.ssh`, `~/.aws`, `~/.claude`, `.env`, `*.pem`, agentbus's own data, …) are never shared.
+An answer that looks like it contains a credential waits for you before it's sent.
 
 Asking you means a native dialog on macOS (Deny / Allow / Always allow folder; a notification on Linux), or
 `agentbus h2h pending` + `agentbus h2h approve|deny <id>` from any terminal. Unanswered requests are denied after 15
-minutes. Jev needs a TypeSafe key (`agentbus h2h config typesafe-key …`); without one, reads that no grant covers ask you.
-Every decision, automatic or yours, is in `agentbus h2h log` (and on the status page), and you get a notification
-summarising the automatic ones after each answer.
+minutes. Every decision is in `agentbus h2h log` (and on the status page).
+
+**Files.** The responder can attach files instead of pasting them (`ATTACH: <path>` lines in its answer): each one passes
+the same checks as reading it, is offered to that person only (a one-time token, valid 7 days), and streams over the
+same iroh connection; the asking side downloads it to `~/agentbus-inbox/<person>/` (up to 2 GiB) before handing its
+agent the answer with the local paths. Your own agents can push a file with the `send_file` tool
+(`agentbus send-file nikita report.pdf`); you confirm each one. `agentbus h2h files` lists both directions.
+
+**Follow-ups** from the same person within 2 hours resume the same responder session, so it remembers what it already
+looked at and sent.
 
 ```sh
 agentbus h2h code | add CODE [--as NAME] [--share FOLDER] | share NAME FOLDER
 agentbus h2h contacts | trust NAME | normal NAME | block NAME | remove NAME
-agentbus h2h pending | approve ID [--always] | deny ID | log
+agentbus h2h rule "TEXT" [--for NAME] | rules | unrule ID | ungrant NAME [FOLDER]
+agentbus h2h pending | approve ID [--always] | deny ID | log | files
+agentbus send-file NAME PATH [--note TEXT]
 agentbus h2h config [name|workspace|responder|model|jev-threshold|typesafe-key VALUE]
 ```
 
@@ -149,6 +161,7 @@ agentbus agents                                   # everyone, on every device
 agentbus send payments.codex@m4air "tests pass on main" [--reply-to ID] [--fyi]
 agentbus inbox [--wait 60] [--all]
 agentbus peers | status
+agentbus upgrade                                  # install the latest release (list_agents and status say when there is one)
 curl http://127.0.0.1:7777/                       # human-readable status + recent messages
 ```
 
