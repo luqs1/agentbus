@@ -128,18 +128,24 @@ fn bash(args: &Value) -> Result<String> {
         },
         None => format!("stopped after {secs}s (timeout)"),
     };
+    let (out, err) = (tail(&out, OUTPUT_MAX_CHARS), tail(&err, OUTPUT_MAX_CHARS / 4));
     let mut text = head;
     if !out.trim().is_empty() {
-        text.push_str(&format!("\n{}", tail(&out, OUTPUT_MAX_CHARS)));
+        text.push_str(&format!("\n{out}"));
     }
     if !err.trim().is_empty() {
-        text.push_str(&format!("\n[stderr]\n{}", tail(&err, OUTPUT_MAX_CHARS / 4)));
+        text.push_str(&format!("\n[stderr]\n{err}"));
     }
     Ok(text)
 }
 
-/// The end of `s` (where errors and results usually are), at most `max` characters.
+/// The end of `s` (where errors and results usually are), at most `max` characters, without carriage returns or
+/// terminal escape codes (Windows programs through WSL interop are full of both).
 fn tail(s: &str, max: usize) -> String {
+    static ESC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let esc = ESC.get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\r").unwrap());
+    let s = esc.replace_all(s, "");
+    let s = s.trim_start_matches('\n');
     let n = s.chars().count();
     if n <= max {
         return s.trim_end().to_string();
@@ -246,5 +252,6 @@ mod tests {
     fn tails_keep_the_end() {
         assert_eq!(tail("abcdef", 10), "abcdef");
         assert!(tail("abcdef", 3).ends_with("\ndef"));
+        assert_eq!(tail("\r\nWindows 11\r\n\x1b[?25l\x1b[32mok\x1b[0m\r\n", 100), "Windows 11\nok");
     }
 }
