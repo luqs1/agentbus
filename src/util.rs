@@ -82,13 +82,6 @@ pub fn tilde(p: &str) -> String {
     }
 }
 
-/// Finds a command on PATH or in the usual per-user install spots (launchd's PATH is minimal).
-pub fn find_exe(name: &str) -> Option<PathBuf> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    let extra = [home().join(".local/bin"), home().join(".claude/local"), home().join(".bun/bin"), PathBuf::from("/opt/homebrew/bin"), PathBuf::from("/usr/local/bin")];
-    path.split(':').filter(|p| !p.is_empty()).map(PathBuf::from).chain(extra).map(|d| d.join(name)).find(|p| p.is_file())
-}
-
 /// Names the kind of credential `text` seems to contain, if any. Cheap and conservative: a match only holds a message
 /// back for the owner to look at.
 pub fn secret_scan(text: &str) -> Option<&'static str> {

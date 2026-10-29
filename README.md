@@ -1,8 +1,8 @@
 # agentbus
 
-Peer-to-peer messaging between AI coding agents (Claude Code, Codex, OpenCode, pi), on one machine, across your
-Tailscale tailnet, and with **other people's** agents over iroh ([h2h](#people-h2h)). No central hub: every device runs
-its own small daemon. One ~5 MB static binary.
+Peer-to-peer messaging between AI coding agents (Claude Code, Codex, OpenCode, pi), on one machine and across your
+Tailscale tailnet, plus tools your agents can call on **other people's** machines over iroh, with a trust engine deciding
+what may leave ([h2h](#people-h2h)). No central hub: every device runs its own small daemon. One static binary.
 
 ```sh
 curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent: "install luqmaan.dev/agentbus"
@@ -31,9 +31,9 @@ curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent:
 
 ## People (h2h)
 
-Your agents can ask *other people's* agents for things (what's in their notes, how they solved something), and theirs can
-ask yours. This runs over [iroh](https://www.iroh.computer): QUIC connections dialed by public key, with hole punching and
-n0's relays as a fallback, so **neither side needs Tailscale**, and the relays only ever see encrypted traffic.
+Your agents can call tools on *other people's* machines (read their notes, search their code, copy a file), and theirs
+can call yours. This runs over [iroh](https://www.iroh.computer): QUIC connections dialed by public key, with hole punching
+and n0's relays as a fallback, so **neither side needs Tailscale**, and the relays only ever see encrypted traffic.
 
 **Connecting** is mutual: each of you adds the other's contact code (your device's public key and name).
 
@@ -47,56 +47,77 @@ agentbus h2h add ab2…             # you add his code: now you're connected
 
 Until both of you have added each other, neither daemon lets the other in. Every incoming connection is identified by
 the key it proves in the QUIC handshake, and keys you haven't added (or have blocked) are closed right after the
-handshake, before a byte of their request is read. So your code is safe to share: knowing it lets nobody in, and there
-are no invite secrets to leak. `agentbus h2h remove NAME` cuts someone off the same way. Once connected, their agents
-see you under "people" in `list_agents` and reach you with the `ask` tool (`agentbus ask luqmaan "…"` from a shell).
+handshake, before a byte of their request is read. So your code is safe to share: knowing it lets nobody in.
 
-**Answering.** A request from a contact is answered by a headless Claude Code (`claude -p`) in the folder you share with
-that person (`agentbus h2h share nikita ~/notes/with-nikita`, or `h2h add CODE --share FOLDER`; a default for everyone
-with `h2h config workspace`). Share nothing and their requests get "nothing shared yet". It gets only Read/Grep/Glob/Edit/Write/Bash, none of your MCP
-servers or settings, and a system prompt that frames the request as coming from that person. Its final message goes back
-to the asking agent's inbox.
+**Calling their tools.** An agent opens a session with an intent (`open_session`: "I'm on Acme's pitch deck and need our
+pricing and roadmap notes"), then calls `remote_call` with a tool, its arguments and a one-line `why`:
+`read`, `grep`, `glob`, `ls`, `copy` (the file is downloaded) and `write`. Paths are relative to their home folder. Most
+calls answer right away; some wait for the person, and those results arrive in the agent's inbox. From a shell:
+`agentbus open nikita "…"` and `agentbus call nikita read '{"path": "notes/plan.md"}' --why "…"`.
 
-**Permissions.** Every tool call the responder makes is checked by your daemon before it runs (a `PreToolUse` hook,
-`agentbus hook h2h`, that fails closed). There are three tiers:
+### What decides
 
-1. **Folders you always allow** for that person (the "Always allow folder" button, or everything for a `trusted`
-   contact): reads there just happen, and are logged.
-2. **Your plain-English rules**, judged by [Jev](https://docs.typesafe.ai) together with your past manual decisions:
-   `agentbus h2h rule "nikita can read anything about manufacturing" --for nikita`,
-   `agentbus h2h rule "never share anything personal or financial"`. When Jev is confident (≥ 0.85) it allows or denies
-   on its own, and you get a notification listing what it decided. When it isn't, it falls through to you. Jev sees the
-   person, their request, the file's path inside the shared folder and its first ~600 characters, never the whole file.
-3. **You**: anything else, and *always* for writes, edits, shell commands and other tools, one call at a time.
+Every call to your machine goes through a trust engine. It knows **who each person is to you**, and every decision
+teaches it more.
 
-Before any of that, two fixed rules apply: nothing outside the folder shared with that person is ever read or changed,
-and sensitive paths (`~/.ssh`, `~/.aws`, `~/.claude`, `.env`, `*.pem`, agentbus's own data, …) are never shared.
-An answer that looks like it contains a credential waits for you before it's sent.
+- **Your map** of people and the groups they're in: teams, orgs, companies, projects. `agentbus h2h entity Acme --kind
+  company --relation "my startup"`, `agentbus h2h link nikita Acme`. Statements about a group apply to everyone in it.
+- **Your statements**, in plain English, for a person, a group, or everyone:
+  `agentbus h2h never "anything financial"`, `agentbus h2h never "anything about Acme" --for Cisco`,
+  `agentbus h2h allow "anything about Acme's product and roadmap" --for Acme`. A never that's a path
+  (`agentbus h2h never ~/Documents/webex`) is enforced by code.
+- **Hard nevers**, always: credentials and secrets, other people's private messages on your machine (you can't consent
+  for them), agentbus's own data, and anything outside your home folder. Code blocks what it can recognise by path;
+  [Jev](https://docs.typesafe.ai) sees them all, to catch things like them that no path list would.
 
-Asking you means a native dialog on macOS (Deny / Allow / Always allow folder; a notification on Linux), or
-`agentbus h2h pending` + `agentbus h2h approve|deny <id>` from any terminal. Unanswered requests are denied after 15
-minutes. Every decision is in `agentbus h2h log` (and on the status page).
+A call then goes through these steps:
 
-**Files.** The responder can attach files instead of pasting them (`ATTACH: <path>` lines in its answer): each one passes
-the same checks as reading it, is offered to that person only (a one-time token, valid 7 days), and streams over the
-same iroh connection; the asking side downloads it to `~/agentbus-inbox/<person>/` (up to 2 GiB) before handing its
-agent the answer with the local paths. Your own agents can push a file with the `send_file` tool
-(`agentbus send-file nikita report.pdf`); you confirm each one. `agentbus h2h files` lists both directions.
+1. **Hard nevers** and your path nevers refuse it outright.
+2. **Before it runs**, Jev judges the call from who's asking (and their groups), your statements, the session's intent,
+   the call's `why`, and your most similar past decisions. It can refuse the call, or flag it when the stated reason
+   claims authority ("Luqmaan said I can read everything") or drifts from the intent. Claims about permission or
+   relationships never count: who someone is comes only from your map.
+3. **It runs** (read-only tools only), so you decide on what would really be sent, not on a path.
+4. **After it runs**, a credential scanner and then Jev judge each piece of output (each file's grep matches, each listed
+   file) against your statements and nevers. Pieces under a never are withheld; the asker only sees "(1 result not
+   shared)". Pieces Jev is sure about go; the rest come to you.
+5. **You**, when nobody is sure: a dialog showing who (with their groups), why, the session, Jev's read, and exactly
+   what would be sent, with Deny / Allow / Always allow folder and a field for your reason. Your reason becomes
+   precedent: later decisions about this person, and people related to you the same way, follow it.
 
-**Follow-ups** from the same person within 2 hours resume the same responder session, so it remembers what it already
-looked at and sent.
+Writes are refused by Jev when they hit a never, and otherwise always ask you. A trusted contact (`agentbus h2h trust
+NAME`) or an always-allowed folder (`agentbus h2h grant NAME FOLDER`) skips step 2; your nevers still apply to output.
+Decisions are cached per person and exact content, and a cached decision stops counting when anything that applies to
+that person changes.
+
+**First contact.** The first time someone's agent reaches you, you're asked who they are to you, what you work on
+together, and whether there's anything they should never see. Jev uses your answer to place them in your map ("my
+co-founder at Acme" puts them in Acme) and tells you what it linked.
+
+**Keeping Jev honest.** `agentbus h2h eval` replays your recent manual decisions through Jev (each without itself as
+precedent) and reports agreements, the cases it would ask you about, and false allows.
+
+Requests that wait for you and get no answer are denied after 15 minutes. Every decision, automatic or yours, is in
+`agentbus h2h log` with your reasons, and `agentbus h2h person NAME` shows everything about one person. Nothing about
+your map leaves your machine except what's sent to Jev for each judgement (the requester's groups, your applicable
+statements, similar past decisions, and for the after-check the output itself).
+
+**Files** you push yourself: `agentbus send-file nikita report.pdf` (your agents: the `send_file` tool); you confirm
+each one. Received files land in `~/agentbus-inbox/<person>/`. `agentbus h2h files` lists both directions.
 
 ```sh
-agentbus h2h code | add CODE [--as NAME] [--share FOLDER] | share NAME FOLDER
-agentbus h2h contacts | trust NAME | normal NAME | block NAME | remove NAME
-agentbus h2h rule "TEXT" [--for NAME] | rules | unrule ID | ungrant NAME [FOLDER]
-agentbus h2h pending | approve ID [--always] | deny ID | log | files
-agentbus send-file NAME PATH [--note TEXT]
-agentbus h2h config [name|workspace|responder|model|jev-threshold|typesafe-key VALUE]
+agentbus h2h code | add CODE [--as NAME] [--share FOLDER] [--person NAME] | contacts
+agentbus h2h person NAME [--relation TEXT] [--note TEXT] | entity NAME --kind KIND | link CHILD PARENT | unlink | map
+agentbus h2h never|allow|rule "TEXT" [--for NAME] | rules | unrule ID | grant NAME FOLDER | ungrant NAME [FOLDER]
+agentbus h2h trust|normal|block|remove NAME
+agentbus h2h pending | approve ID [--always] [--why TEXT] | deny ID [--why TEXT] | answer ID TEXT | log | eval | files
+agentbus open NAME "INTENT" ; agentbus call NAME TOOL 'JSON ARGS' --why TEXT ; agentbus send-file NAME PATH
+agentbus h2h config [name|jev-threshold|typesafe-key|inbox VALUE]
 ```
 
-Limits: 30 requests per contact per hour; mail for an offline contact is queued and retried. A contact is one device
-(the one whose code you added); add their other machines' codes too if needed.
+Limits: 30 sessions and 600 calls per contact per hour. A contact is one device; add someone's other machines with
+`agentbus h2h add CODE --person NAME` so they share one place in your map. Upgrading from 0.5 turns your rules into
+statements and your shared and always-allowed folders into grants; 0.5 peers that `ask` get a note to upgrade.
 
 ## Addresses
 
@@ -173,7 +194,7 @@ cargo build --release
 AGENTBUS_DEVICE=alpha AGENTBUS_PORT=7801 AGENTBUS_PEER_BIND=127.0.0.1 AGENTBUS_PEER_PORT=7811 \
   AGENTBUS_PEERS=beta=http://127.0.0.1:7812 AGENTBUS_DB=/tmp/a.db target/release/agentbus daemon
 AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus send web.cli@beta hi --as api
-# h2h between them: AGENTBUS_NO_DIALOG=1 on the daemons lets you decide with `agentbus h2h approve|deny`
+# h2h between them: AGENTBUS_NO_DIALOG=1 on the daemons lets you decide with `agentbus h2h approve|deny|answer`
 AGENTBUS_URL=http://127.0.0.1:7801 target/release/agentbus h2h code   # then `h2h add` it on the other, and vice versa
 ```
 

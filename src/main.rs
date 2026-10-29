@@ -1,10 +1,13 @@
 //! agentbus: peer-to-peer messaging between AI coding agents (Claude Code, Codex, OpenCode, pi) on one machine
-//! and across your Tailscale tailnet. Every device runs its own daemon; there is no central hub.
+//! and across your Tailscale tailnet, and remote tools on other people's machines over iroh. Every device runs its own
+//! daemon; there is no central hub.
 
 mod daemon;
 mod h2h;
 mod install;
+mod remote;
 mod shim;
+mod trust;
 mod util;
 
 use anyhow::{anyhow, Result};
@@ -14,7 +17,7 @@ use std::time::Duration;
 use util::*;
 
 #[derive(Parser)]
-#[command(name = "agentbus", version, about = "Peer-to-peer messaging for coding agents: across your machines over Tailscale, and with other people over iroh",
+#[command(name = "agentbus", version, about = "Peer-to-peer messaging for coding agents across your machines over Tailscale, and remote tools on other people's machines over iroh",
           after_help = "Addresses: <task>.<harness>@<machine>, e.g. payments.codex@m4air. Run from inside an agent's shell, \
                         the CLI speaks as that agent; otherwise as <--as>.cli (default me.cli).")]
 struct Cli {
@@ -53,11 +56,24 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Ask a person you've paired with (h2h); the answer arrives in your inbox
-    Ask {
+    /// Open a session with a person you've paired with: say what you need (then use `agentbus call`)
+    Open {
         to: String,
         #[arg(required = true, num_args = 1..)]
-        question: Vec<String>,
+        intent: Vec<String>,
+        #[arg(long = "as")]
+        as_: Option<String>,
+    },
+    /// Call a tool on a paired person's machine: read, grep, glob, ls, copy, write
+    Call {
+        to: String,
+        tool: String,
+        /// The tool's arguments as JSON, e.g. '{"path": "notes/plan.md"}'
+        #[arg(default_value = "{}")]
+        args: String,
+        /// Why you need this (they see it)
+        #[arg(long)]
+        why: String,
         #[arg(long = "as")]
         as_: Option<String>,
     },
@@ -70,7 +86,7 @@ enum Cmd {
         #[arg(long = "as")]
         as_: Option<String>,
     },
-    /// People: pair with other people's agentbus and control what their agents may do here
+    /// People: pair with other people, map who they are to you, and decide what their agents may do here
     H2h {
         #[command(subcommand)]
         cmd: H2hCmd,
@@ -110,54 +126,121 @@ enum H2hCmd {
         /// What to call them here (default: the name in their code)
         #[arg(long = "as")]
         as_: Option<String>,
-        /// Folder to share with them (their agents can only be answered from here)
+        /// A folder to always allow for them
         #[arg(long)]
         share: Option<String>,
+        /// Another device of someone already in your map: link it to that person
+        #[arg(long)]
+        person: Option<String>,
     },
-    /// Set the folder shared with one person ("" for the default); everything outside it is refused
-    Share { name: String, folder: String },
     /// People you've paired with
     Contacts,
-    /// Let a contact read anything inside your workspace without asking (changes still ask)
+    /// Show what you know about a person, or set who they are to you
+    Person {
+        name: String,
+        /// Who they are to you, e.g. "co-founder at Acme"
+        #[arg(long)]
+        relation: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Add or update a group in your map: team, org, company, project, group or topic
+    Entity {
+        name: String,
+        #[arg(long, default_value = "group")]
+        kind: String,
+        /// Who they are to you, e.g. "my employer", "client"
+        #[arg(long)]
+        relation: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Put someone (or a group) inside a group: statements about the group then apply to them
+    Link {
+        child: String,
+        parent: String,
+        /// member_of, part_of or works_on
+        #[arg(long, default_value = "member_of")]
+        rel: String,
+    },
+    /// Take someone (or a group) out of a group
+    Unlink { child: String, parent: String },
+    /// Everyone and every group in your map
+    Map,
+    /// Something that must never go to them: plain English ("anything financial") or a path (~/Documents/webex, enforced by code)
+    Never {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// A person or group (default: everyone)
+        #[arg(long = "for")]
+        for_: Option<String>,
+    },
+    /// Something they may have without asking you, in plain English
+    Allow {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        #[arg(long = "for")]
+        for_: Option<String>,
+    },
+    /// Any other plain-English rule Jev should apply
+    Rule {
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        #[arg(long = "for")]
+        for_: Option<String>,
+    },
+    /// The hard nevers and all your statements
+    Rules,
+    /// Remove a statement by its number
+    Unrule { id: String },
+    /// Always allow a folder for a person or group ("everyone" for everyone); your nevers still apply
+    Grant { name: String, folder: String },
+    /// Withdraw always-allowed folders (all of them, or one)
+    Ungrant { name: String, folder: Option<String> },
+    /// Their reads skip the check before the call (your nevers still apply to output; changes still ask)
     Trust { name: String },
-    /// Back to the default: reads follow your past decisions and Jev, and ask when unsure
+    /// Back to the default: your rules and Jev decide, and you're asked when nobody's sure
     Normal { name: String },
     /// Refuse all requests from a contact
     Block { name: String },
-    /// Forget a contact and the folders you shared with them
+    /// Forget a contact (what you said about them stays in your map)
     Remove { name: String },
-    /// Requests waiting for your decision
+    /// Requests and questions waiting for you
     Pending,
-    /// Allow a pending request (--always: share that folder with them from now on)
+    /// Allow a pending request (--always: always allow that folder for them)
     Approve {
         id: String,
         #[arg(long)]
         always: bool,
+        /// Why (Jev learns from it)
+        #[arg(long)]
+        why: Option<String>,
     },
     /// Deny a pending request
-    Deny { id: String },
-    /// Files received from contacts, and files offered to them
-    Files,
-    /// Add a plain-English rule Jev applies to reads and file copies (it decides when confident and notifies you)
-    Rule {
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-        /// Only for this person (default: everyone)
-        #[arg(long = "for")]
-        for_: Option<String>,
+    Deny {
+        id: String,
+        #[arg(long)]
+        why: Option<String>,
     },
-    /// Your plain-English rules
-    Rules,
-    /// Remove a rule by its number
-    Unrule { id: String },
-    /// Withdraw "always allowed" folders from someone (all of them, or one)
-    Ungrant { name: String, folder: Option<String> },
-    /// Every decision on contacts' requests, automatic ones included
+    /// Answer a question about someone (the first time they reach you)
+    Answer {
+        id: String,
+        #[arg(num_args = 0..)]
+        text: Vec<String>,
+    },
+    /// Every decision on contacts' calls, automatic ones included, with your reasons
     Log {
         #[arg(long, default_value_t = 30)]
         limit: i64,
     },
-    /// Show settings, or set one: name, workspace, responder, model, jev-threshold, typesafe-key ("" to clear)
+    /// Replay your recent decisions through Jev and report how often it agrees with you
+    Eval {
+        #[arg(long, default_value_t = 30)]
+        limit: i64,
+    },
+    /// Files received from contacts, and files offered to them
+    Files,
+    /// Show settings, or set one: name, jev-threshold, typesafe-key, inbox ("" to clear)
     Config { key: Option<String>, value: Option<String> },
 }
 
@@ -170,33 +253,41 @@ fn h2h_call(route: &str, body: serde_json::Value, timeout: Duration) -> Result<(
 
 fn h2h(cmd: H2hCmd) -> Result<()> {
     let t = Duration::from_secs(15);
+    let folder = |f: &str| std::fs::canonicalize(expand_home(f)).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| f.to_string());
     match cmd {
         H2hCmd::Code => h2h_call("h2h-code", json!({}), t),
-        H2hCmd::Add { code, as_, share } => {
-            let share = share.map(|f| std::fs::canonicalize(expand_home(&f)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(f));
-            h2h_call("h2h-add", json!({ "code": code, "name": as_, "share": share }), Duration::from_secs(60))
-        }
-        H2hCmd::Share { name, folder } => {
-            let folder = if folder.is_empty() { folder } else { std::fs::canonicalize(expand_home(&folder)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(folder) };
-            h2h_call("h2h-share", json!({ "name": name, "folder": folder }), t)
+        H2hCmd::Add { code, as_, share, person } => {
+            h2h_call("h2h-add", json!({ "code": code, "name": as_, "share": share.map(|f| folder(&f)), "person": person }), Duration::from_secs(60))
         }
         H2hCmd::Contacts => h2h_call("h2h-contacts", json!({}), t),
+        H2hCmd::Person { name, relation, note } => h2h_call("h2h-person", json!({ "name": name, "relation": relation, "note": note }), t),
+        H2hCmd::Entity { name, kind, relation, note } => h2h_call("h2h-entity", json!({ "name": name, "kind": kind, "relation": relation, "note": note }), t),
+        H2hCmd::Link { child, parent, rel } => h2h_call("h2h-link", json!({ "child": child, "parent": parent, "rel": rel }), t),
+        H2hCmd::Unlink { child, parent } => h2h_call("h2h-link", json!({ "child": child, "parent": parent, "remove": "1" }), t),
+        H2hCmd::Map => h2h_call("h2h-map", json!({}), t),
+        H2hCmd::Never { text, for_ } => h2h_call("h2h-statement", json!({ "kind": "never", "text": text.join(" "), "for": for_ }), t),
+        H2hCmd::Allow { text, for_ } => h2h_call("h2h-statement", json!({ "kind": "allow", "text": text.join(" "), "for": for_ }), t),
+        H2hCmd::Rule { text, for_ } => h2h_call("h2h-statement", json!({ "kind": "rule", "text": text.join(" "), "for": for_ }), t),
+        H2hCmd::Rules => h2h_call("h2h-rules", json!({}), t),
+        H2hCmd::Unrule { id } => h2h_call("h2h-unrule", json!({ "id": id }), t),
+        H2hCmd::Grant { name, folder: f } => h2h_call("h2h-grant", json!({ "name": name, "folder": folder(&f) }), t),
+        H2hCmd::Ungrant { name, folder: f } => h2h_call("h2h-ungrant", json!({ "name": name, "folder": f.map(|f| folder(&f)) }), t),
         H2hCmd::Trust { name } => h2h_call("h2h-level", json!({ "name": name, "level": "trusted" }), t),
         H2hCmd::Normal { name } => h2h_call("h2h-level", json!({ "name": name, "level": "normal" }), t),
         H2hCmd::Block { name } => h2h_call("h2h-level", json!({ "name": name, "level": "blocked" }), t),
         H2hCmd::Remove { name } => h2h_call("h2h-level", json!({ "name": name, "level": "remove" }), t),
         H2hCmd::Pending => h2h_call("h2h-pending", json!({}), t),
-        H2hCmd::Approve { id, always } => h2h_call("h2h-resolve", json!({ "id": id, "choice": if always { "always" } else { "allow" } }), t),
-        H2hCmd::Deny { id } => h2h_call("h2h-resolve", json!({ "id": id, "choice": "deny" }), t),
-        H2hCmd::Files => h2h_call("h2h-files", json!({}), t),
-        H2hCmd::Rule { text, for_ } => h2h_call("h2h-rule", json!({ "text": text.join(" "), "for": for_ }), t),
-        H2hCmd::Rules => h2h_call("h2h-rules", json!({}), t),
-        H2hCmd::Unrule { id } => h2h_call("h2h-unrule", json!({ "id": id }), t),
-        H2hCmd::Ungrant { name, folder } => {
-            let folder = folder.map(|f| std::fs::canonicalize(expand_home(&f)).map(|p| p.to_string_lossy().into_owned()).unwrap_or(f)).unwrap_or_default();
-            h2h_call("h2h-ungrant", json!({ "name": name, "folder": folder }), t)
+        H2hCmd::Approve { id, always, why } => {
+            h2h_call("h2h-resolve", json!({ "id": id, "choice": if always { "always" } else { "allow" }, "text": why.unwrap_or_default() }), t)
+        }
+        H2hCmd::Deny { id, why } => h2h_call("h2h-resolve", json!({ "id": id, "choice": "deny", "text": why.unwrap_or_default() }), t),
+        H2hCmd::Answer { id, text } => {
+            let text = text.join(" ");
+            h2h_call("h2h-resolve", json!({ "id": id, "choice": if text.trim().is_empty() { "deny" } else { "allow" }, "text": text }), t)
         }
         H2hCmd::Log { limit } => h2h_call("h2h-log", json!({ "limit": limit.to_string() }), t),
+        H2hCmd::Eval { limit } => h2h_call("h2h-eval", json!({ "limit": limit.to_string() }), Duration::from_secs(30 * 60)),
+        H2hCmd::Files => h2h_call("h2h-files", json!({}), t),
         H2hCmd::Config { key, value } => {
             if key.is_some() && value.is_none() {
                 return Err(anyhow!("give a value (\"\" clears it)"));
@@ -249,7 +340,7 @@ fn main() {
                         return Err(anyhow!("installed, but the daemon isn't answering yet; then run: agentbus h2h add {code}"));
                     }
                     println!();
-                    h2h(H2hCmd::Add { code, as_: None, share: None })?;
+                    h2h(H2hCmd::Add { code, as_: None, share: None, person: None })?;
                     println!();
                     h2h_call("h2h-code", json!({ "short": "1" }), t)?;
                 }
@@ -278,14 +369,27 @@ fn main() {
                 println!("{}", post_json(&format!("{base}/api/send-file"), &body.into(), Duration::from_secs(20 * 60))?["text"].as_str().unwrap_or(""));
                 Ok(())
             }
-            Cmd::Ask { to, question, as_ } => {
+            Cmd::Open { to, intent, as_ } => {
                 let mut body = serde_json::Map::new();
                 for (k, v) in identity(as_) {
                     body.insert(k.into(), json!(v));
                 }
                 body.insert("to".into(), json!(to));
-                body.insert("question".into(), json!(question.join(" ")));
-                println!("{}", post_json(&format!("{base}/api/ask"), &body.into(), Duration::from_secs(60))?["text"].as_str().unwrap_or(""));
+                body.insert("intent".into(), json!(intent.join(" ")));
+                println!("{}", post_json(&format!("{base}/api/open"), &body.into(), Duration::from_secs(60))?["text"].as_str().unwrap_or(""));
+                Ok(())
+            }
+            Cmd::Call { to, tool, args, why, as_ } => {
+                let mut body = serde_json::Map::new();
+                for (k, v) in identity(as_) {
+                    body.insert(k.into(), json!(v));
+                }
+                let args: serde_json::Value = serde_json::from_str(&args).map_err(|_| anyhow!("args must be JSON, e.g. '{{\"path\": \"notes/plan.md\"}}'"))?;
+                body.insert("to".into(), json!(to));
+                body.insert("tool".into(), json!(tool));
+                body.insert("args".into(), args);
+                body.insert("why".into(), json!(why));
+                println!("{}", post_json(&format!("{base}/api/call"), &body.into(), Duration::from_secs(150))?["text"].as_str().unwrap_or(""));
                 Ok(())
             }
             Cmd::Mcp { harness } => shim::mcp(&harness),
