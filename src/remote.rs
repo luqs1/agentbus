@@ -144,7 +144,12 @@ fn excerpt(items: &[&Item], max: usize) -> String {
         if out.len() >= max {
             break;
         }
-        out.push_str(&format!("{}\n{}\n", it.path, it.text));
+        // A glob's item is its own path, and an ls entry is its name: show those once.
+        if it.text == it.path || it.path.ends_with(&format!("/{}", it.text.split("  (").next().unwrap_or("").trim_end_matches('/'))) {
+            out.push_str(&format!("{}\n", it.text));
+        } else {
+            out.push_str(&format!("{}\n{}\n", it.path, it.text));
+        }
     }
     out.chars().take(max).collect()
 }
@@ -411,12 +416,26 @@ impl H2h {
         );
         let reply = self.manual(&x.c, &x.sid, "read", &x.tool, &x.label(), &body, &MANUAL_BUTTONS).await;
         let allow = reply.choice != Choice::Deny;
-        for i in &unsure {
+        let decision = if allow { "allow" } else { "deny" };
+        // One answer covers every piece shown, but the reason may only be about some of them: only those become precedent.
+        let covered: Vec<bool> = if unsure.len() > 1 && !reply.text.trim().is_empty() {
+            let items: Vec<(String, String)> = unsure.iter().map(|i| (ran.items[*i].path.clone(), ran.items[*i].text.clone())).collect();
+            match trust::reason_covers(decision, &reply.text, &items).await {
+                Some(c) => c.into_iter().map(|p| p >= 0.5).collect(),
+                None => vec![true; unsure.len()],
+            }
+        } else {
+            vec![true; unsure.len()]
+        };
+        for (i, covered) in unsure.iter().zip(covered) {
             let it = &ran.items[*i];
-            self.rec(&x, &it.path, if allow { "allow" } else { "deny" }, "manual", None, "post", &reply.text, &it.text);
-            let key = trust::item_key(&self.db(), x.person, &it.path, &it.text);
-            trust::cache_put(&self.db(), &key, if allow { "allow" } else { "deny" }, "manual");
             verdicts[*i] = if allow { Verdict::Send } else { Verdict::Withhold("manual") };
+            if !covered {
+                continue;
+            }
+            self.rec(&x, &it.path, decision, "manual", None, "post", &reply.text, &it.text);
+            let key = trust::item_key(&self.db(), x.person, &it.path, &it.text);
+            trust::cache_put(&self.db(), &key, decision, "manual");
         }
         if reply.choice == Choice::Always {
             let folder = if x.path.is_dir() { x.path.clone() } else { x.path.parent().map(Path::to_path_buf).unwrap_or(x.path.clone()) };
