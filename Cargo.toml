@@ -16,7 +16,8 @@ regex = { version = "1", default-features = false, features = ["std", "perf", "u
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util", "fs"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 urlencoding = "2"
 

@@ -49,15 +49,28 @@ pub fn catalog() -> Vec<Value> {
 
 /// One piece of output, judged on its own: a file's lines, one file's matches, a listing.
 #[derive(Clone)]
-struct Item {
-    path: String,
-    text: String,
+pub(crate) struct Item {
+    pub path: String,
+    pub text: String,
 }
 
-struct Ran {
-    items: Vec<Item>,
+pub(crate) struct Ran {
+    pub items: Vec<Item>,
     /// Shown after the items: "(lines 1-400 of 2000; …)", "(stopped at 200 matches)".
-    note: String,
+    pub note: String,
+}
+
+/// What the asking agent sees: the items (grep's under their file name), how many were held back, then the note.
+pub(crate) fn render(tool: &str, items: &[&Item], held: usize, note: &str) -> String {
+    let out: Vec<String> = items.iter().map(|it| if tool == "grep" { format!("{}\n{}", it.path, it.text) } else { it.text.clone() }).collect();
+    let mut out = if matches!(tool, "glob" | "ls") { vec![out.join("\n")] } else { out };
+    if held > 0 {
+        out.push(format!("({held} result(s) not shared)"));
+    }
+    if !note.is_empty() {
+        out.push(note.to_string());
+    }
+    out.join("\n\n")
 }
 
 #[derive(Clone, Debug)]
@@ -377,22 +390,9 @@ impl H2h {
         if held == ran.items.len() {
             return Ok(denied());
         }
-        let out: Vec<String> = ran
-            .items
-            .iter()
-            .zip(sent)
-            .filter(|(_, s)| **s)
-            .map(|(it, _)| if x.tool == "grep" { format!("{}\n{}", it.path, it.text) } else { it.text.clone() })
-            .collect();
-        let mut out = if matches!(x.tool.as_str(), "glob" | "ls") { vec![out.join("\n")] } else { out };
-        if held > 0 {
-            out.push(format!("({held} result(s) not shared)"));
-        }
-        if !ran.note.is_empty() {
-            out.push(ran.note.clone());
-        }
+        let shown: Vec<&Item> = ran.items.iter().zip(sent).filter(|(_, s)| **s).map(|(it, _)| it).collect();
         let files = if x.tool == "copy" { vec![self.offer(&x.c, &x.path)?] } else { vec![] };
-        Ok(json!({ "status": "ok", "output": out.join("\n\n"), "files": files }))
+        Ok(json!({ "status": "ok", "output": render(&x.tool, &shown, held, &ran.note), "files": files }))
     }
 
     async fn owner_decides(self: Arc<Self>, x: Ctx, ran: Ran, mut verdicts: Vec<Verdict>, unsure: Vec<usize>) {
@@ -698,7 +698,7 @@ fn older(c: &Contact, e: anyhow::Error) -> anyhow::Error {
 
 // --- the tools themselves (blocking; run on a worker thread) ---------------------------------------
 
-fn run(tool: &str, path: &Path, args: &Value, never_paths: &[String]) -> Result<Ran> {
+pub(crate) fn run(tool: &str, path: &Path, args: &Value, never_paths: &[String]) -> Result<Ran> {
     let shown = tilde(&path.to_string_lossy());
     match tool {
         "read" => {

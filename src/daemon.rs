@@ -26,6 +26,8 @@ and on the user's other machines over Tailscale. Addresses look like <task>.<har
 - You get a name from your project folder automatically. Call register with a task name if you're doing something specific.
 - list_agents shows who is reachable; send messages an address, a comma-separated list, or \"*\" for everyone.
 - Replies are delivered to you automatically where your harness supports it; otherwise use check_inbox (wait_seconds blocks).
+- The user's other machines (listed by list_agents) take remote_call directly: read, grep, glob, ls, copy, write and bash \
+there, with no session and no permission checks, since they're the user's own devices.
 - People the user has paired with (listed by list_agents) are reached with open_session (say what you need) and then \
 remote_call (read, grep, glob, ls, copy, write on their machine, each with a why), not send. Their agentbus checks every \
 call against their permissions; some results wait for them and arrive in your inbox.
@@ -565,6 +567,39 @@ impl Daemon {
         rows
     }
 
+    /// `to` as one of the owner's other devices (a tailnet peer logged in as them): its name and peer URL. A paired
+    /// person with the same name wins.
+    pub(crate) async fn own_device(self: &Arc<Self>, to: &str) -> Option<(String, String)> {
+        let dev = to.trim().trim_start_matches('@').to_lowercase();
+        if dev.is_empty() || dev == self.device || crate::h2h::get().is_some_and(|h| h.contact_by_name(&dev).is_ok()) {
+            return None;
+        }
+        self.fresh_peers().await;
+        let url = self.peers.lock().unwrap().get(&dev).map(|p| p.url.clone());
+        url.map(|u| (dev, u))
+    }
+
+    /// On one of the owner's own devices: straight there. On a person's machine: through their permissions.
+    pub(crate) async fn remote_call(self: &Arc<Self>, a: &Agent, to: &str, tool: &str, args: &Value, why: &str) -> Result<String> {
+        if let Some((dev, url)) = self.own_device(to).await {
+            return crate::own::call(a, &self.addr(a), &dev, &url, tool, args).await;
+        }
+        let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
+        h.remote_call(a, to, tool, args, why).await
+    }
+
+    pub(crate) async fn open_session(self: &Arc<Self>, a: &Agent, to: &str, intent: &str) -> Result<String> {
+        if let Some((dev, _)) = self.own_device(to).await {
+            return Ok(format!(
+                "{dev} is one of your own devices, so there's no session and nothing is checked: call remote_call(to=\"{dev}\", tool, \
+                 args) directly. Paths are relative to its home folder; absolute paths work too.\n\nTools:\n{}",
+                crate::own::tools_text()
+            ));
+        }
+        let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
+        h.open_session(a, to, intent).await
+    }
+
     async fn agents_text(self: &Arc<Self>, key: Option<&str>) -> String {
         self.refresh_peers().await;
         let line = |addr: String, harness: &str, project: &str, last_seen: i64, desc: Option<&str>, you: bool| {
@@ -587,7 +622,8 @@ impl Daemon {
         }
         let peers = self.peers.lock().unwrap().clone();
         for (device, p) in peers {
-            out.push(device.clone());
+            let own = !newer("0.6.0", &p.version);
+            out.push(if own { format!("{device} (yours: remote_call(to=\"{device}\") runs tools there directly)") } else { device.clone() });
             if p.agents.is_empty() {
                 out.push("  (no agents)".into());
             }
@@ -640,19 +676,15 @@ impl Daemon {
                 let r = self.send(&a.key, s("to"), s("message"), reply_to.as_deref(), args["wake"].as_bool() != Some(false)).await?;
                 Ok(r["text"].as_str().unwrap_or("").to_string())
             }
-            "open_session" => {
-                let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
-                h.open_session(a, s("to"), s("intent")).await
-            }
+            "open_session" => self.open_session(a, s("to"), s("intent")).await,
             "remote_call" => {
-                let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
                 // Some harnesses send nested objects as JSON text.
                 let call_args = match &args["args"] {
                     Value::String(t) => serde_json::from_str(t).unwrap_or(json!({})),
                     v if v.is_object() => v.clone(),
                     _ => json!({}),
                 };
-                h.remote_call(a, s("to"), s("tool"), &call_args, s("why")).await
+                self.remote_call(a, s("to"), s("tool"), &call_args, s("why")).await
             }
             "send_file" => {
                 let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
@@ -734,13 +766,13 @@ pub fn tools() -> Value {
         },
         {
             "name": "remote_call",
-            "description": "Call a tool on a paired person's machine, in the session you opened with open_session. Tools (paths relative to their home folder): read {path, offset?, limit?}; grep {pattern, path?, glob?, ignore_case?}; glob {pattern, path?}; ls {path}; copy {path} (the file is downloaded to this machine); write {path, content} (always waits for them). Most calls answer right away; some wait for the person to decide, and those results arrive in your inbox as a reply. Refused calls just say \"not shared\": don't try to get the same thing another way.",
+            "description": "Call a tool on another machine. On the user's own devices (machines in list_agents) it runs directly, with no session or checks, and bash is there too: bash {command, cwd?, timeout? (seconds, max 600)}. On a paired person's machine it runs in the session you opened with open_session. Tools (paths relative to their home folder): read {path, offset?, limit?}; grep {pattern, path?, glob?, ignore_case?}; glob {pattern, path?}; ls {path}; copy {path} (the file is downloaded to this machine); write {path, content} (always waits for them). Most calls answer right away; some wait for the person to decide, and those results arrive in your inbox as a reply. Refused calls just say \"not shared\": don't try to get the same thing another way.",
             "inputSchema": { "type": "object", "properties": {
-                "to": { "type": "string", "description": "The person's name" },
-                "tool": { "type": "string", "enum": ["read", "grep", "glob", "ls", "copy", "write"] },
+                "to": { "type": "string", "description": "One of the user's machines (e.g. kismet-lianli), or a person's name" },
+                "tool": { "type": "string", "enum": ["read", "grep", "glob", "ls", "copy", "write", "bash"] },
                 "args": { "type": "object", "description": "The tool's arguments, e.g. {\"path\": \"notes/plan.md\"}" },
-                "why": { "type": "string", "description": "Why this call, in a sentence. They see it." }
-            }, "required": ["to", "tool", "args", "why"] }
+                "why": { "type": "string", "description": "Why this call, in a sentence. A person sees it; optional on your own devices." }
+            }, "required": ["to", "tool", "args"] }
         },
         {
             "name": "send_file",
@@ -818,20 +850,18 @@ async fn api(State(d): S, Path(route): Path<String>, Query(q): Query<HashMap<Str
                 Ok(v)
             }
             "open" => {
-                let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
                 let mut v = me(&a);
-                v["text"] = json!(h.open_session(&a, &s("to"), &s("intent")).await?);
+                v["text"] = json!(d.open_session(&a, &s("to"), &s("intent")).await?);
                 Ok(v)
             }
             "call" => {
-                let h = crate::h2h::get().ok_or_else(|| anyhow!("h2h isn't running on this device"))?;
                 let call_args = match p.get("args") {
                     Some(Value::String(t)) => serde_json::from_str(t).map_err(|_| anyhow!("args must be a JSON object"))?,
                     Some(v) if v.is_object() => v.clone(),
                     _ => json!({}),
                 };
                 let mut v = me(&a);
-                v["text"] = json!(h.remote_call(&a, &s("to"), &s("tool"), &call_args, &s("why")).await?);
+                v["text"] = json!(d.remote_call(&a, &s("to"), &s("tool"), &call_args, &s("why")).await?);
                 Ok(v)
             }
             "send" => {
@@ -941,6 +971,40 @@ async fn peer_deliver(State(d): S, ConnectInfo(addr): ConnectInfo<SocketAddr>, b
     }
 }
 
+/// A tool call from one of the owner's other devices: run directly, nothing judged.
+async fn peer_tool(State(d): S, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
+    if let Some(r) = peer_guard(&d, addr).await {
+        return r;
+    }
+    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    match tokio::task::spawn_blocking(move || crate::own::serve(&req)).await {
+        Ok(Ok(out)) => Json(json!({ "output": out })).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// A `copy` from one of the owner's other devices: the file's bytes, streamed.
+async fn peer_fetch(State(d): S, ConnectInfo(addr): ConnectInfo<SocketAddr>, body: Bytes) -> Response {
+    if let Some(r) = peer_guard(&d, addr).await {
+        return r;
+    }
+    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let opened = match crate::own::fetch(&req) {
+        Ok((path, name, size)) => tokio::fs::File::open(&path).await.map(|f| (f, name, size)).map_err(anyhow::Error::from),
+        Err(e) => Err(e),
+    };
+    match opened {
+        Ok((f, name, size)) => Response::builder()
+            .header("content-length", size)
+            .header("content-type", "application/octet-stream")
+            .header("x-agentbus-name", urlencoding::encode(&name).into_owned())
+            .body(axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(f)))
+            .unwrap_or_else(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
 pub async fn run() -> Result<()> {
     let d = Daemon::new().await?;
     let local = Router::new()
@@ -966,6 +1030,8 @@ pub async fn run() -> Result<()> {
             .route("/health", get(health))
             .route("/peer/hello", get(peer_hello))
             .route("/peer/deliver", post(peer_deliver))
+            .route("/peer/tool", post(peer_tool))
+            .route("/peer/fetch", post(peer_fetch))
             .with_state(d.clone());
         match tokio::net::TcpListener::bind((bind.as_str(), peer_port)).await {
             Ok(l) => {

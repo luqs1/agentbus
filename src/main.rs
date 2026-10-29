@@ -5,6 +5,7 @@
 mod daemon;
 mod h2h;
 mod install;
+mod own;
 mod remote;
 mod shim;
 mod trust;
