@@ -581,6 +581,10 @@ impl Daemon {
 
     /// On one of the owner's own devices: straight there. On a person's machine: through their permissions.
     pub(crate) async fn remote_call(self: &Arc<Self>, a: &Agent, to: &str, tool: &str, args: &Value, why: &str) -> Result<String> {
+        if to.trim().trim_start_matches('@').eq_ignore_ascii_case(&self.device) && tool != "copy" {
+            let req = json!({ "tool": tool, "args": args, "from": self.addr(a) });
+            return tokio::task::spawn_blocking(move || crate::own::serve(&req)).await?; // this machine: just run it
+        }
         if let Some((dev, url)) = self.own_device(to).await {
             return crate::own::call(a, &self.addr(a), &dev, &url, tool, args).await;
         }
