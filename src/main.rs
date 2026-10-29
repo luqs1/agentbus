@@ -65,15 +65,16 @@ enum Cmd {
         #[arg(long = "as")]
         as_: Option<String>,
     },
-    /// Call a tool on a paired person's machine: read, grep, glob, ls, copy, write
+    /// Call a tool on one of your machines (read, grep, glob, ls, copy, write, bash; nothing checked) or on a paired
+    /// person's machine (all but bash, through their permissions)
     Call {
         to: String,
         tool: String,
-        /// The tool's arguments as JSON, e.g. '{"path": "notes/plan.md"}'
+        /// The tool's arguments as JSON, e.g. '{"path": "notes/plan.md"}' or '{"command": "nvidia-smi"}'
         #[arg(default_value = "{}")]
         args: String,
-        /// Why you need this (they see it)
-        #[arg(long)]
+        /// Why you need this (a person sees it; not needed for your own machines)
+        #[arg(long, default_value = "")]
         why: String,
         #[arg(long = "as")]
         as_: Option<String>,
