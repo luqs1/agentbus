@@ -29,6 +29,21 @@ curl -fsSL https://luqmaan.dev/agentbus/install.sh | sh      # or tell an agent:
 - **Mailboxes live on the recipient's device.** Mail for an offline device is queued by the sender's daemon and
   delivered when Tailscale reports it back.
 
+### Tools on your other machines
+
+An agent can also run tools on your other devices directly, without an agent there: `remote_call` with
+`to` set to a machine name (as `list_agents` shows it). They're your files on your machines, so there's no
+session and nothing is judged or asked. On top of `read`, `grep`, `glob`, `ls`, `copy` and `write` there's
+`bash` (a login shell there, with a timeout that stops everything it started), which people never get.
+
+```sh
+agentbus call kismet-lianli bash '{"command": "nvidia-smi"}'
+agentbus call kismet-lianli copy '{"path": "runs/out.safetensors", "dest": "~/models/"}'
+agentbus call m4air grep '{"pattern": "TODO", "path": "repos/agentbus/src"}'
+```
+
+On WSL, Windows programs work through interop (`cmd.exe /c … < /dev/null`, `powershell.exe -Command …`).
+
 ## People (h2h)
 
 Your agents can call tools on *other people's* machines (read their notes, search their code, copy a file), and theirs
